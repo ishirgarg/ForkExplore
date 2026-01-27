@@ -86,6 +86,14 @@ def main(config: Config):
         "training/critic_loss",
         "training/entropy",
         "training/sps",
+        "training/forking/enabled",
+        "training/forking/num_forked",
+        "training/forking/mean_score",
+        "training/forking/std_score",
+        "training/forking/min_score",
+        "training/forking/max_score",
+        "training/forking/bottom_k_mean_score",
+        "training/forking/top_k_mean_score",
     ]
 
     metrics_recorder = MetricsRecorder(

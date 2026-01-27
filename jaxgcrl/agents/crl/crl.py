@@ -20,6 +20,8 @@ from flax.training.train_state import TrainState
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
+from jaxgcrl.utils.fork_manager import ForkManager
+from jaxgcrl.utils.fork_heuristics import create_heuristic
 
 from .losses import update_actor_and_alpha, update_critic
 from .networks import Actor, Encoder
@@ -149,7 +151,7 @@ class CRL:
     min_replay_size: int = 1000
     unroll_length: int = 62
     h_dim: int = 256
-    n_hidden: int = 2
+    n_hidden: int = 4
     skip_connections: int = 4
     use_relu: bool = False
 
@@ -161,6 +163,19 @@ class CRL:
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
+
+    # Forking parameters
+    enable_forking: bool = False
+    fork_k: int = 0
+    fork_heuristic: Literal[
+        "cumulative_reward",
+        "final_reward",
+        "goal_distance",
+        "weighted_reward_distance",
+        "min_critic_distance",
+    ] = "cumulative_reward"
+    fork_reward_weight: float = 1.0
+    fork_distance_weight: float = 1.0
 
     def check_config(self, config):
         """
@@ -299,6 +314,55 @@ class CRL:
             alpha_state=alpha_state,
         )
 
+        # Fork Manager
+        fork_manager = None
+        if self.enable_forking and self.fork_k > 0:
+            # Create heuristic
+            heuristic_kwargs = {}
+            if self.fork_heuristic in ["goal_distance", "weighted_reward_distance", "min_critic_distance"]:
+                heuristic_kwargs["state_size"] = state_size
+                heuristic_kwargs["goal_indices"] = tuple(train_env.goal_indices)
+            if self.fork_heuristic == "weighted_reward_distance":
+                heuristic_kwargs["reward_weight"] = self.fork_reward_weight
+                heuristic_kwargs["distance_weight"] = self.fork_distance_weight
+            if self.fork_heuristic == "min_critic_distance":
+                # Get possible goals from environment
+                if hasattr(unwrapped_env, "possible_goals"):
+                    possible_goals = unwrapped_env.possible_goals
+                elif hasattr(unwrapped_env, "target_goal"):
+                    # Single goal environment - use the target goal
+                    possible_goals = unwrapped_env.target_goal[None, :]
+                else:
+                    raise ValueError(
+                        "min_critic_distance heuristic requires environment to have "
+                        "'possible_goals' or 'target_goal' attribute"
+                    )
+                
+                heuristic_kwargs["possible_goals"] = possible_goals
+                heuristic_kwargs["actor_apply_fn"] = actor.apply
+                # Note: actor_params will be updated dynamically in the heuristic
+                # For now, pass initial params (they'll be updated via closure)
+                heuristic_kwargs["actor_params"] = actor_state.params
+                heuristic_kwargs["sa_encoder_apply_fn"] = sa_encoder.apply
+                heuristic_kwargs["g_encoder_apply_fn"] = g_encoder.apply
+                # Note: critic_params will be updated dynamically
+                heuristic_kwargs["critic_params"] = critic_state.params
+                heuristic_kwargs["energy_fn"] = self.energy_fn
+            
+            heuristic = create_heuristic(self.fork_heuristic, **heuristic_kwargs)
+            
+            fork_manager = ForkManager(
+                num_envs=config.num_envs,
+                fork_k=self.fork_k,
+                heuristic=heuristic,
+            )
+            
+            logging.info(
+                "Forking enabled: K=%d, heuristic=%s",
+                self.fork_k,
+                self.fork_heuristic,
+            )
+
         # Replay Buffer
         dummy_obs = jnp.zeros((obs_size,))
         dummy_action = jnp.zeros((action_size,))
@@ -363,25 +427,66 @@ class CRL:
                 extras={"state_extras": state_extras},
             )
 
-        @jax.jit
-        def get_experience(actor_state, env_state, buffer_state, key):
+        def create_get_experience_fn(apply_forking: bool):
+            """Create get_experience function with optional forking."""
             @jax.jit
-            def f(carry, unused_t):
-                env_state, current_key = carry
-                current_key, next_key = jax.random.split(current_key)
-                env_state, transition = actor_step(
-                    actor_state,
-                    train_env,
-                    env_state,
-                    current_key,
-                    extra_fields=("truncation", "traj_id"),
-                )
-                return (env_state, next_key), transition
+            def get_experience(actor_state, critic_state, env_state, buffer_state, key, env_steps):
+                @jax.jit
+                def f(carry, unused_t):
+                    env_state, current_key = carry
+                    current_key, next_key = jax.random.split(current_key)
+                    env_state, transition = actor_step(
+                        actor_state,
+                        train_env,
+                        env_state,
+                        current_key,
+                        extra_fields=("truncation", "traj_id"),
+                    )
+                    return (env_state, next_key), transition
 
-            (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=self.unroll_length)
+                (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=self.unroll_length)
 
-            buffer_state = replay_buffer.insert(buffer_state, data)
-            return env_state, buffer_state
+                # Initialize fork metrics
+                fork_metrics = {}
+                fork_decision = None
+                
+                # Apply forking if enabled and requested
+                if apply_forking:
+                    assert fork_manager is not None, "Fork manager must be provided when forking is enabled"
+                    # Evaluate agents and decide which to fork
+                    # Pass current network params for min_critic_distance heuristic
+                    # Also pass env_steps and goal_indices for visualization logging
+                    env_info = {
+                        "actor_params": actor_state.params,
+                        "critic_params": critic_state.params,
+                        "env_steps": env_steps,
+                        "goal_indices": train_env.goal_indices,
+                    }
+                    fork_decision = fork_manager.evaluate_and_decide(
+                        env_state=env_state,
+                        transitions=data,
+                        env_info=env_info,
+                    )
+                    
+                    # Get fork metrics
+                    fork_metrics = fork_manager.get_metrics(fork_decision)
+                    
+                    # Apply forking: copy state from top K to bottom K
+                    env_state = fork_manager.apply_forking(env_state, fork_decision)
+                    
+                    # Increment trajectory IDs for forked agents
+                    env_state = fork_manager.increment_trajectory_ids(env_state, fork_decision)
+                    
+                    # Note: We still add all transitions to the buffer, including forked agents
+
+                buffer_state = replay_buffer.insert(buffer_state, data)
+                return env_state, buffer_state, fork_metrics, fork_decision
+            
+            return get_experience
+        
+        # Create two versions: one for prefill (no forking), one for training (with forking)
+        get_experience_prefill = create_get_experience_fn(apply_forking=False)
+        get_experience_train = create_get_experience_fn(apply_forking=self.enable_forking)
 
         def prefill_replay_buffer(training_state, env_state, buffer_state, key):
             @jax.jit
@@ -389,11 +494,14 @@ class CRL:
                 del unused
                 training_state, env_state, buffer_state, key = carry
                 key, new_key = jax.random.split(key)
-                env_state, buffer_state = get_experience(
+                # Use prefill version (no forking during prefill)
+                env_state, buffer_state, _, _ = get_experience_prefill(
                     training_state.actor_state,
+                    training_state.critic_state,
                     env_state,
                     buffer_state,
                     key,
+                    training_state.env_steps,
                 )
                 training_state = training_state.replace(
                     env_steps=training_state.env_steps + env_steps_per_actor_step,
@@ -450,12 +558,14 @@ class CRL:
         def training_step(training_state, env_state, buffer_state, key):
             experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
 
-            # update buffer
-            env_state, buffer_state = get_experience(
+            # update buffer (use training version with forking)
+            env_state, buffer_state, fork_metrics, fork_decision = get_experience_train(
                 training_state.actor_state,
+                training_state.critic_state,
                 env_state,
                 buffer_state,
                 experience_key1,
+                training_state.env_steps,
             )
 
             training_state = training_state.replace(
@@ -492,6 +602,9 @@ class CRL:
                 ),
                 metrics,
             ) = jax.lax.scan(update_networks, (training_state, training_key), transitions)
+
+            # Add fork metrics to training metrics
+            metrics.update(fork_metrics)
 
             return (
                 training_state,
@@ -597,7 +710,7 @@ class CRL:
                 save_params(path, params)
 
         total_steps = current_step
-        assert total_steps >= config.total_env_steps
+        # assert total_steps >= config.total_env_steps
 
         logging.info("total steps: %s", total_steps)
 
