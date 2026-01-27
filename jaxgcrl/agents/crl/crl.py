@@ -8,8 +8,10 @@ from typing import Any, Callable, Literal, NamedTuple, Optional, Tuple, Union
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import numpy as np
 import optax
+import wandb
 from brax import base, envs
 from brax.training import types
 from brax.v1 import envs as envs_v1
@@ -658,6 +660,57 @@ class CRL:
             key=eval_env_key,
         )
 
+        def visualize_replay_buffer_final_states(
+            buffer_state,
+            goal_indices: jnp.ndarray,
+            state_size: int,
+            env_steps: int,
+        ):
+            """Visualize final states from a random replay buffer sample.
+            
+            Args:
+                buffer_state: Current replay buffer state
+                goal_indices: Indices to use for extracting goal positions
+                state_size: Size of state portion of observation
+                env_steps: Current environment steps for logging
+                key: Random key for sampling
+            """
+         
+            # Sample a batch from the replay buffer
+            buffer_state, transitions = replay_buffer.sample(buffer_state)
+            observations = transitions.observation  # (num_envs, episode_length, obs_size)
+
+            final_obs = observations[:, -1, :]  # (num_envs, obs_size) - last step of each trajectory
+            final_states = final_obs[:, :state_size]  # (num_envs, state_size)
+            
+            final_positions = np.array(final_states[:, goal_indices])  # (num_envs, goal_size)            
+            final_positions_np = np.array(final_positions)  # (num_envs, goal_size)
+            
+            # Create the plot
+            fig, ax = plt.subplots(figsize=(10, 8))
+            
+            # Create scatter plot of final states
+            ax.scatter(
+                final_positions_np[:, 0],
+                final_positions_np[:, 1],
+                s=50,
+                alpha=0.6,
+                c='blue',
+                edgecolors='none',
+            )
+            
+            ax.set_xlabel('X Position')
+            ax.set_ylabel('Y Position')
+            ax.set_title(f'Final States from Replay Buffer (Step: {env_steps:,})')
+            ax.grid(True, alpha=0.3)
+            
+            # Log to wandb
+            wandb.log({
+                "replay_buffer/final_states_visualization": wandb.Image(fig),
+            }, step=env_steps)
+            
+            plt.close(fig)
+
         training_walltime = 0
         logging.info("starting training....")
         for ne in range(config.num_evals):
@@ -686,6 +739,14 @@ class CRL:
 
             metrics = evaluator.run_evaluation(training_state, metrics)
             logging.info("step: %d", current_step)
+
+            # Visualize replay buffer final states once per epoch
+            visualize_replay_buffer_final_states(
+                buffer_state=buffer_state,
+                goal_indices=train_env.goal_indices,
+                state_size=state_size,
+                env_steps=current_step,
+            )
 
             do_render = ne % config.visualization_interval == 0
             make_policy = lambda param: lambda obs, rng: actor.apply(param, obs)
