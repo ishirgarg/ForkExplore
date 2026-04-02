@@ -49,7 +49,7 @@ class RunConfig:
     eval_env: Optional[Literal[legal_envs]] = None
 
     # number of envs to run in parallel during training
-    num_envs: int = 64
+    num_envs: int = 256
 
     # number of envs to run in parallel during evaluation
     num_eval_envs: int = 256
@@ -65,7 +65,7 @@ class RunConfig:
     # wandb logging
     exp_name: str = "run"
     log_wandb: bool = True
-    wandb_project_name: str = "forkexplore"
+    wandb_project_name: str = "jaxgcrl"
     wandb_group: str = "."
 
     # online or offline

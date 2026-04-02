@@ -1,5 +1,4 @@
 # <span style="color: orange;">JaxGCRL</span>
-ICLR 2025 Spotlight!
 
 
 ![envs_grid](imgs/grid.png)

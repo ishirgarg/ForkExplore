@@ -14,6 +14,7 @@ from jax import numpy as jnp
 
 RESET = R = "r"
 GOAL = G = "g"
+SQUARE = S = "s"
 
 
 U_MAZE = [
@@ -21,14 +22,6 @@ U_MAZE = [
     [1, R, G, G, 1],
     [1, 1, 1, G, 1],
     [1, G, G, G, 1],
-    [1, 1, 1, 1, 1],
-]
-
-U_MAZE_HARD = [
-    [1, 1, 1, 1, 1],
-    [1, R, 0, 0, 1],
-    [1, 1, 1, 0, 1],
-    [1, G, 0, 0, 1],
     [1, 1, 1, 1, 1],
 ]
 
@@ -51,6 +44,92 @@ BIG_MAZE = [
     [1, G, G, G, 1, G, G, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
+
+BIG_MAZE_THREE_CORNER = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, S, 1, 1, S, G, 1],
+    [1, S, S, 1, S, S, S, 1],
+    [1, 1, S, S, S, 1, 1, 1],
+    [1, S, S, 1, S, S, S, 1],
+    [1, S, 1, G, S, 1, S, 1],
+    [1, S, S, S, 1, G, S, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+BIG_MAZE_TWO_CORNER = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, S, 1, 1, S, G, 1],
+    [1, S, S, 1, S, S, S, 1],
+    [1, 1, S, S, S, 1, 1, 1],
+    [1, S, S, 1, S, S, S, 1],
+    [1, S, 1, G, S, 1, S, 1],
+    [1, S, S, S, 1, S, S, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+BIG_MAZE_ONE_CORNER = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, S, 1, 1, S, G, 1],
+    [1, S, S, 1, S, S, S, 1],
+    [1, 1, S, S, S, 1, 1, 1],
+    [1, S, S, 1, S, S, S, 1],
+    [1, S, 1, G, S, 1, S, 1],
+    [1, S, S, S, 1, S, S, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+BIGGER_MAZE_THREE_CORNER = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, S, S, 1, 1, S, S, S, 1, 1, S, G, 1],
+    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
+    [1, 1, 1, S, 1, S, 1, 1, 1, 1, S, 1, 1, 1],
+    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
+    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
+    [1, S, S, S, 1, S, S, S, S, S, S, 1, S, 1],
+    [1, 1, 1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1],
+    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
+    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
+    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
+    [1, 1, 1, S, 1, 1, 1, 1, 1, 1, S, 1, 1, 1],
+    [1, G, S, S, S, S, S, 1, S, S, S, S, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+BIGGER_MAZE_TWO_CORNER = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, S, S, 1, 1, S, S, S, 1, 1, S, G, 1],
+    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
+    [1, 1, 1, S, 1, S, 1, 1, 1, 1, S, 1, 1, 1],
+    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
+    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
+    [1, S, S, S, 1, S, S, S, S, S, S, 1, S, 1],
+    [1, 1, 1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1],
+    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
+    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
+    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
+    [1, 1, 1, S, 1, 1, 1, 1, 1, 1, S, 1, 1, 1],
+    [1, G, S, S, S, S, S, 1, S, S, S, S, S, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+BIGGER_MAZE_ONE_CORNER = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, S, S, 1, 1, S, S, S, 1, 1, S, S, 1],
+    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
+    [1, 1, 1, S, 1, S, 1, 1, 1, 1, S, 1, 1, 1],
+    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
+    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
+    [1, S, S, S, 1, S, S, S, S, S, S, 1, S, 1],
+    [1, 1, 1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1],
+    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
+    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
+    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
+    [1, 1, 1, S, 1, 1, 1, 1, 1, 1, S, 1, 1, 1],
+    [1, G, S, S, S, S, S, 1, S, S, S, S, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+
 
 BIG_MAZE_EVAL = [
     [1, 1, 1, 1, 1, 1, 1, 1],
@@ -107,15 +186,43 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = U_MAZE_EVAL
     elif maze_layout_name == "big_maze":
         maze_layout = BIG_MAZE
+    elif maze_layout_name == "big_maze_one_corner":
+        maze_layout = BIG_MAZE_ONE_CORNER
+    elif maze_layout_name == "big_maze_two_corner":
+        maze_layout = BIG_MAZE_TWO_CORNER
+    elif maze_layout_name == "big_maze_three_corner":
+        maze_layout = BIG_MAZE_THREE_CORNER
+    elif maze_layout_name == "bigger_maze_one_corner":
+        maze_layout = BIGGER_MAZE_ONE_CORNER
+    elif maze_layout_name == "bigger_maze_two_corner":
+        maze_layout = BIGGER_MAZE_TWO_CORNER
+    elif maze_layout_name == "bigger_maze_three_corner":
+        maze_layout = BIGGER_MAZE_THREE_CORNER
     elif maze_layout_name == "big_maze_eval":
         maze_layout = BIG_MAZE_EVAL
     elif maze_layout_name == "hardest_maze":
         maze_layout = HARDEST_MAZE
-    elif maze_layout_name == "u_maze_hard":
-        maze_layout = U_MAZE_HARD
     else:
         raise ValueError(f"Unknown maze layout: {maze_layout_name}")
+    
+    # get the x and y bounds
+    walkable = [
+        (i, j)
+        for i in range(len(maze_layout))
+        for j in range(len(maze_layout[0]))
+        if maze_layout[i][j] != 1
+    ]
+    hx = hy = 0.5 * maze_size_scaling
 
+    xmin_free = min(i * maze_size_scaling - hx for i, j in walkable)
+    xmax_free = max(i * maze_size_scaling + hx for i, j in walkable)
+    ymin_free = min(j * maze_size_scaling - hy for i, j in walkable)
+    ymax_free = max(j * maze_size_scaling + hy for i, j in walkable)
+
+    x_bounds = (xmin_free, xmax_free)
+    y_bounds = (ymin_free, ymax_free)
+
+    # get the xml path
     xml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "ant_maze.xml")
 
     possible_starts = find_starts(maze_layout, maze_size_scaling)
@@ -154,7 +261,7 @@ def make_maze(maze_layout_name, maze_size_scaling):
     tree = tree.getroot()
     xml_string = ET.tostring(tree)
 
-    return xml_string, possible_starts, possible_goals
+    return xml_string, possible_starts, possible_goals, x_bounds, y_bounds
 
 
 class AntMaze(PipelineEnv):
@@ -175,7 +282,9 @@ class AntMaze(PipelineEnv):
         dense_reward: bool = False,
         **kwargs,
     ):
-        xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
+        xml_string, possible_starts, possible_goals, x_bounds, y_bounds = make_maze(maze_layout_name, maze_size_scaling)
+        self.x_bounds = x_bounds
+        self.y_bounds = y_bounds
 
         sys = mjcf.loads(xml_string)
         self.possible_starts = possible_starts

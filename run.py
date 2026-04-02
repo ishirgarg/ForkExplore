@@ -86,14 +86,15 @@ def main(config: Config):
         "training/critic_loss",
         "training/entropy",
         "training/sps",
-        "training/forking/enabled",
-        "training/forking/num_forked",
-        "training/forking/mean_score",
-        "training/forking/std_score",
-        "training/forking/min_score",
-        "training/forking/max_score",
-        "training/forking/bottom_k_mean_score",
-        "training/forking/top_k_mean_score",
+        "adaptive_mixing/mixing_raw",
+        "adaptive_mixing/mixing_smoothed",
+        "adaptive_mixing/rb_grad_trvar",
+        "adaptive_mixing/env_grad_trvar",
+        "adaptive_mixing/rb_grad_mean_norm",
+        "adaptive_mixing/env_grad_mean_norm",
+        "adaptive_mixing/env_rb_bias_squared",
+        "adaptive_mixing/num_rb_samples",
+        "adaptive_mixing/num_env_samples",
     ]
 
     metrics_recorder = MetricsRecorder(
