@@ -86,15 +86,8 @@ def main(config: Config):
         "training/critic_loss",
         "training/entropy",
         "training/sps",
-        "adaptive_mixing/mixing_raw",
-        "adaptive_mixing/mixing_smoothed",
-        "adaptive_mixing/rb_grad_trvar",
-        "adaptive_mixing/env_grad_trvar",
-        "adaptive_mixing/rb_grad_mean_norm",
-        "adaptive_mixing/env_grad_mean_norm",
-        "adaptive_mixing/env_rb_bias_squared",
-        "adaptive_mixing/num_rb_samples",
-        "adaptive_mixing/num_env_samples",
+        "training/go_phase_success_rate",
+        "training/avg_go_phase_steps",
     ]
 
     metrics_recorder = MetricsRecorder(

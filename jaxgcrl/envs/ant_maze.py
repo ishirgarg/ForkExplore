@@ -14,7 +14,6 @@ from jax import numpy as jnp
 
 RESET = R = "r"
 GOAL = G = "g"
-SQUARE = S = "s"
 
 
 U_MAZE = [
@@ -22,6 +21,14 @@ U_MAZE = [
     [1, R, G, G, 1],
     [1, 1, 1, G, 1],
     [1, G, G, G, 1],
+    [1, 1, 1, 1, 1],
+]
+
+U_MAZE_HARD = [
+    [1, 1, 1, 1, 1],
+    [1, R, 0, 0, 1],
+    [1, 1, 1, 0, 1],
+    [1, G, 0, 0, 1],
     [1, 1, 1, 1, 1],
 ]
 
@@ -45,91 +52,16 @@ BIG_MAZE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
-BIG_MAZE_THREE_CORNER = [
+BIG_MAZE_HARD = [
     [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, S, 1, 1, S, G, 1],
-    [1, S, S, 1, S, S, S, 1],
-    [1, 1, S, S, S, 1, 1, 1],
-    [1, S, S, 1, S, S, S, 1],
-    [1, S, 1, G, S, 1, S, 1],
-    [1, S, S, S, 1, G, S, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-BIG_MAZE_TWO_CORNER = [
-    [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, S, 1, 1, S, G, 1],
-    [1, S, S, 1, S, S, S, 1],
-    [1, 1, S, S, S, 1, 1, 1],
-    [1, S, S, 1, S, S, S, 1],
-    [1, S, 1, G, S, 1, S, 1],
-    [1, S, S, S, 1, S, S, 1],
+    [1, R, 0, 1, 1, 0, G, 1],
+    [1, 0, 0, 1, 0, 0, 0, 1],
+    [1, 1, 0, 0, 0, 1, 1, 1],
+    [1, 0, 0, 1, 0, 0, 0, 1],
+    [1, 0, 1, 0, 0, 1, 0, 1],
+    [1, G, 0, 0, 1, G, 0, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
-
-BIG_MAZE_ONE_CORNER = [
-    [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, S, 1, 1, S, G, 1],
-    [1, S, S, 1, S, S, S, 1],
-    [1, 1, S, S, S, 1, 1, 1],
-    [1, S, S, 1, S, S, S, 1],
-    [1, S, 1, G, S, 1, S, 1],
-    [1, S, S, S, 1, S, S, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-BIGGER_MAZE_THREE_CORNER = [
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, S, S, 1, 1, S, S, S, 1, 1, S, G, 1],
-    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
-    [1, 1, 1, S, 1, S, 1, 1, 1, 1, S, 1, 1, 1],
-    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
-    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
-    [1, S, S, S, 1, S, S, S, S, S, S, 1, S, 1],
-    [1, 1, 1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1],
-    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
-    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
-    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
-    [1, 1, 1, S, 1, 1, 1, 1, 1, 1, S, 1, 1, 1],
-    [1, G, S, S, S, S, S, 1, S, S, S, S, G, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-BIGGER_MAZE_TWO_CORNER = [
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, S, S, 1, 1, S, S, S, 1, 1, S, G, 1],
-    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
-    [1, 1, 1, S, 1, S, 1, 1, 1, 1, S, 1, 1, 1],
-    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
-    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
-    [1, S, S, S, 1, S, S, S, S, S, S, 1, S, 1],
-    [1, 1, 1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1],
-    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
-    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
-    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
-    [1, 1, 1, S, 1, 1, 1, 1, 1, 1, S, 1, 1, 1],
-    [1, G, S, S, S, S, S, 1, S, S, S, S, S, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-BIGGER_MAZE_ONE_CORNER = [
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, S, S, 1, 1, S, S, S, 1, 1, S, S, 1],
-    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
-    [1, 1, 1, S, 1, S, 1, 1, 1, 1, S, 1, 1, 1],
-    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
-    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
-    [1, S, S, S, 1, S, S, S, S, S, S, 1, S, 1],
-    [1, 1, 1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1],
-    [1, S, S, S, S, S, S, S, S, 1, S, S, S, 1],
-    [1, S, 1, 1, 1, S, 1, 1, S, 1, 1, 1, S, 1],
-    [1, S, S, S, 1, S, S, 1, S, S, S, S, S, 1],
-    [1, 1, 1, S, 1, 1, 1, 1, 1, 1, S, 1, 1, 1],
-    [1, G, S, S, S, S, S, 1, S, S, S, S, G, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-
 
 BIG_MAZE_EVAL = [
     [1, 1, 1, 1, 1, 1, 1, 1],
@@ -182,47 +114,21 @@ def find_goals(structure, size_scaling):
 def make_maze(maze_layout_name, maze_size_scaling):
     if maze_layout_name == "u_maze":
         maze_layout = U_MAZE
+    elif maze_layout_name == "u_maze_hard":
+        maze_layout = U_MAZE_HARD
     elif maze_layout_name == "u_maze_eval":
         maze_layout = U_MAZE_EVAL
     elif maze_layout_name == "big_maze":
         maze_layout = BIG_MAZE
-    elif maze_layout_name == "big_maze_one_corner":
-        maze_layout = BIG_MAZE_ONE_CORNER
-    elif maze_layout_name == "big_maze_two_corner":
-        maze_layout = BIG_MAZE_TWO_CORNER
-    elif maze_layout_name == "big_maze_three_corner":
-        maze_layout = BIG_MAZE_THREE_CORNER
-    elif maze_layout_name == "bigger_maze_one_corner":
-        maze_layout = BIGGER_MAZE_ONE_CORNER
-    elif maze_layout_name == "bigger_maze_two_corner":
-        maze_layout = BIGGER_MAZE_TWO_CORNER
-    elif maze_layout_name == "bigger_maze_three_corner":
-        maze_layout = BIGGER_MAZE_THREE_CORNER
+    elif maze_layout_name == "big_maze_hard":
+        maze_layout = BIG_MAZE_HARD
     elif maze_layout_name == "big_maze_eval":
         maze_layout = BIG_MAZE_EVAL
     elif maze_layout_name == "hardest_maze":
         maze_layout = HARDEST_MAZE
     else:
         raise ValueError(f"Unknown maze layout: {maze_layout_name}")
-    
-    # get the x and y bounds
-    walkable = [
-        (i, j)
-        for i in range(len(maze_layout))
-        for j in range(len(maze_layout[0]))
-        if maze_layout[i][j] != 1
-    ]
-    hx = hy = 0.5 * maze_size_scaling
 
-    xmin_free = min(i * maze_size_scaling - hx for i, j in walkable)
-    xmax_free = max(i * maze_size_scaling + hx for i, j in walkable)
-    ymin_free = min(j * maze_size_scaling - hy for i, j in walkable)
-    ymax_free = max(j * maze_size_scaling + hy for i, j in walkable)
-
-    x_bounds = (xmin_free, xmax_free)
-    y_bounds = (ymin_free, ymax_free)
-
-    # get the xml path
     xml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "ant_maze.xml")
 
     possible_starts = find_starts(maze_layout, maze_size_scaling)
@@ -261,7 +167,7 @@ def make_maze(maze_layout_name, maze_size_scaling):
     tree = tree.getroot()
     xml_string = ET.tostring(tree)
 
-    return xml_string, possible_starts, possible_goals, x_bounds, y_bounds
+    return xml_string, possible_starts, possible_goals
 
 
 class AntMaze(PipelineEnv):
@@ -282,9 +188,37 @@ class AntMaze(PipelineEnv):
         dense_reward: bool = False,
         **kwargs,
     ):
-        xml_string, possible_starts, possible_goals, x_bounds, y_bounds = make_maze(maze_layout_name, maze_size_scaling)
-        self.x_bounds = x_bounds
-        self.y_bounds = y_bounds
+        xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
+
+        # Get maze layout to calculate bounds
+        if maze_layout_name == "u_maze":
+            maze_layout = U_MAZE
+        elif maze_layout_name == "u_maze_hard":
+            maze_layout = U_MAZE_HARD
+        elif maze_layout_name == "u_maze_eval":
+            maze_layout = U_MAZE_EVAL
+        elif maze_layout_name == "big_maze":
+            maze_layout = BIG_MAZE
+        elif maze_layout_name == "big_maze_hard":
+            maze_layout = BIG_MAZE_HARD
+        elif maze_layout_name == "big_maze_eval":
+            maze_layout = BIG_MAZE_EVAL
+        elif maze_layout_name == "hardest_maze":
+            maze_layout = HARDEST_MAZE
+        else:
+            raise ValueError(f"Unknown maze layout: {maze_layout_name}")
+
+        # Calculate x and y bounds based on maze layout dimensions
+        num_rows = len(maze_layout)
+        num_cols = len(maze_layout[0])
+        self.x_bounds = jnp.array([
+            0.5 * maze_size_scaling,
+            (num_rows - 0.5) * maze_size_scaling
+        ])
+        self.y_bounds = jnp.array([
+            0.5 * maze_size_scaling,
+            (num_cols - 0.5) * maze_size_scaling
+        ])
 
         sys = mjcf.loads(xml_string)
         self.possible_starts = possible_starts
@@ -331,8 +265,16 @@ class AntMaze(PipelineEnv):
         if self._use_contact_forces:
             raise NotImplementedError("use_contact_forces not implemented.")
 
-    def reset(self, rng: jax.Array) -> State:
-        """Resets the environment to an initial state."""
+    def reset(self, rng: jax.Array, goal=None, start=None) -> State:
+        """Resets the environment to an initial state.
+
+        Args:
+            rng:   Random key.
+            goal:  Optional (2,) goal position.  If None, sampled randomly.
+            start: Optional (2,) start xy position.  If None, sampled randomly.
+                   Pass a fixed value from GoExploreWrapper so the ant always
+                   returns to the same starting cell across go phases.
+        """
 
         rng, rng1, rng2, rng3 = jax.random.split(rng, 4)
 
@@ -340,18 +282,25 @@ class AntMaze(PipelineEnv):
         q = self.sys.init_q + jax.random.uniform(rng, (self.sys.q_size(),), minval=low, maxval=hi)
         qd = hi * jax.random.normal(rng1, (self.sys.qd_size(),))
 
-        # set the start and target q, qd
-        start = self._random_start(rng2)
-        q = q.at[:2].set(start)
+        # Use provided start position or sample a random one
+        if start is None:
+            start_pos = self._random_start(rng2)
+        else:
+            start_pos = start
+        q = q.at[:2].set(start_pos)
 
-        target = self._random_target(rng3)
+        if goal is None:
+            target = self._random_target(rng3)
+        else:
+            target = goal
+        
         q = q.at[-2:].set(target)
-
         qd = qd.at[-2:].set(0)
 
         pipeline_state = self.pipeline_init(q, qd)
         obs = self._get_obs(pipeline_state)
 
+        # Return metrics
         reward, done, zero = jnp.zeros(3)
         metrics = {
             "reward_forward": zero,

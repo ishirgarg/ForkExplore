@@ -1,11 +1,58 @@
 import time
 
 import jax
+import jax.numpy as jp
 import numpy as np
 from brax import envs
+from brax.envs.base import State, Wrapper
 from brax.training import acting
 from brax.training.types import Metrics, PolicyParams
 
+
+class EvalWrapper(Wrapper):
+    """Brax env with eval metrics."""
+
+    def reset(self, rng: jax.Array) -> State:
+        reset_state = self.env.reset(rng)
+        reset_state.metrics['reward'] = reset_state.reward
+        eval_metrics = envs.training.EvalMetrics(
+            episode_metrics=jax.tree_util.tree_map(
+                jp.zeros_like, reset_state.metrics
+            ),
+            active_episodes=jp.ones_like(reset_state.reward),
+            episode_steps=jp.zeros_like(reset_state.reward),
+        )
+        reset_state.info['eval_metrics'] = eval_metrics
+        return reset_state
+
+    def step(self, state: State, action: jax.Array, rng=None) -> State:
+        state_metrics = state.info['eval_metrics']
+        if not isinstance(state_metrics, envs.training.EvalMetrics):
+            raise ValueError(
+                f'Incorrect type for state_metrics: {type(state_metrics)}'
+            )
+        del state.info['eval_metrics']
+        nstate = self.env.step(state, action, rng)
+        nstate.metrics['reward'] = nstate.reward
+        episode_steps = jp.where(
+            state_metrics.active_episodes,
+            nstate.info['steps'],
+            state_metrics.episode_steps,
+        )
+        episode_metrics = jax.tree_util.tree_map(
+            lambda a, b: a + b * state_metrics.active_episodes,
+            state_metrics.episode_metrics,
+            nstate.metrics,
+        )
+        active_episodes = state_metrics.active_episodes * (1 - nstate.done)
+
+        eval_metrics = envs.training.EvalMetrics(
+            episode_metrics=episode_metrics,
+            active_episodes=active_episodes,
+            episode_steps=episode_steps,
+        )
+        nstate.info['eval_metrics'] = eval_metrics
+        return nstate
 
 # TODO: make only single type of Evaluator
 class Evaluator(acting.Evaluator):
@@ -86,7 +133,7 @@ class ActorEvaluator:
         self._key = key
         self._eval_walltime = 0.0
 
-        eval_env = envs.training.EvalWrapper(eval_env)
+        eval_env = EvalWrapper(eval_env)
 
         def generate_eval_unroll(training_state, key):
             reset_keys = jax.random.split(key, num_eval_envs)

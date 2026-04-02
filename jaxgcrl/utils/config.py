@@ -2,12 +2,12 @@ from typing import Literal, Optional, Union
 
 from flax.struct import dataclass
 
-from jaxgcrl.agents import CRL, PPO, SAC, TD3
+from jaxgcrl.agents import Baseline, CRL, GoExplore, PPO, SAC, TD3
 
 from .env import legal_envs
 
 # agent configurations
-AgentConfig = Union[CRL, PPO, SAC, TD3]
+AgentConfig = Union[Baseline, CRL, GoExplore, PPO, SAC, TD3]
 
 
 @dataclass
@@ -57,7 +57,7 @@ class RunConfig:
     action_repeat: int = 1
 
     # total number of evals during training
-    num_evals: int = 200
+    num_evals: int = 100
 
     seed: int = 0
     backend: Optional[Literal["mjx", "spring", "positional", "generalized"]] = None
