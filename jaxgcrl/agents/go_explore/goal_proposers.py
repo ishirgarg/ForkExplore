@@ -1,13 +1,10 @@
-from typing import Callable, Dict, Any, Optional
+from typing import Any, Callable, Optional
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-from jaxgcrl.agents.go_explore.utils import sample_trajectories_from_buffer, flatten_batch
 from jaxgcrl.agents.go_explore.algorithms_utils import reconstruct_full_critic_params
 from jaxgcrl.agents.go_explore.types import GoalProposerState
 from jaxgcrl.agents.go_explore.utils import geometric_sample_one_triple
-
 
 
 def create_goal_proposer(
@@ -112,16 +109,6 @@ def create_rb_goal_proposer(
         return goal, goal_proposer_state, log_data
     
     return propose_goal
-
-
-from typing import Callable, Dict, Any, Optional
-
-import jax
-import jax.numpy as jnp
-import numpy as np
-from jaxgcrl.agents.go_explore.utils import sample_trajectories_from_buffer
-from jaxgcrl.agents.go_explore.algorithms_utils import reconstruct_full_critic_params
-from jaxgcrl.agents.go_explore.types import GoalProposerState
 
 
 def create_ucgr_goal_proposer(
@@ -427,96 +414,6 @@ def create_max_critic_to_env_goal_proposer(
     return propose_goal
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Explore Reward Functions (for Go Explore algorithm)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def q_epistemic_reward(
-    first_obs: jnp.ndarray,
-    current_obs: jnp.ndarray,
-    gcp_actor,
-    gcp_actor_params,
-    critic,
-    full_critic_params,
-    state_size: int,
-    goal_indices,
-    rng: jax.Array,
-) -> jnp.ndarray:
-    """Compute epistemic uncertainty reward for the explore phase.
-
-    For current state ``w``, measures Q-value variance across the critic ensemble
-    when asking: "from first_obs (go-phase start state), how reachable is w?"
-
-    Args:
-        first_obs:          (obs_size,)  - Observation at start of go phase.
-        current_obs:        (obs_size,)  - Observation at current explore step.
-        gcp_actor:          Goal-conditioned policy object.
-        gcp_actor_params:   Params for the GCP actor.
-        critic:             Critic object with ``apply(params, obs, action) -> (n_critics,)``.
-        full_critic_params: Reconstructed full critic params dict.
-        state_size:         Number of elements in the state portion of obs.
-        goal_indices:       Array of indices selecting goal dims from state.
-        rng:                JAX random key.
-
-    Returns:
-        Scalar reward = std of Q-values across the critic ensemble.
-    """
-    goal_idx_array = jnp.array(goal_indices)
-    first_state = first_obs[:state_size]                             # (state_size,)
-    current_goal = current_obs[:state_size][goal_idx_array]          # (goal_dim,)
-
-    obs = jnp.concatenate([first_state, current_goal], axis=-1)      # (obs_size,)
-
-    action = gcp_actor.sample_actions(
-        gcp_actor_params, obs[None, :], rng, is_deterministic=True
-    )  # (1, action_size)
-    action = action[0]                                               # (action_size,)
-
-    q_values = critic.apply(
-        full_critic_params, obs[None, :], action[None, :]
-    )  # (1, n_critics)
-    q_values = q_values[0]                                           # (n_critics,)
-
-    return jnp.std(q_values)
-
-
-def create_explore_reward_fn(
-    reward_type: str,
-    critic,
-    gcp_actor,
-    state_size: int,
-    goal_indices,
-):
-    """Factory function to create explore reward functions.
-
-    Args:
-        reward_type:   One of ``"q_epistemic"``.
-        critic:        Critic object used for Q-value computation.
-        gcp_actor:     Goal-conditioned actor object.
-        state_size:    Size of the state portion in observations.
-        goal_indices:  Indices selecting goal dims from state.
-
-    Returns:
-        A callable ``explore_reward_fn(first_obs, current_obs,
-            gcp_actor_params, full_critic_params, rng) -> scalar``.
-    """
-    if reward_type == "q_epistemic":
-        def explore_reward_fn(
-            first_obs: jnp.ndarray,
-            current_obs: jnp.ndarray,
-            gcp_actor_params,
-            full_critic_params,
-            rng: jax.Array,
-        ) -> jnp.ndarray:
-            return q_epistemic_reward(
-                first_obs, current_obs,
-                gcp_actor, gcp_actor_params,
-                critic, full_critic_params,
-                state_size, goal_indices, rng,
-            )
-        return explore_reward_fn
-    else:
-        raise ValueError(f"Unknown explore reward_type: {reward_type}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JAX Gaussian KDE helper (shared by MEGA and OMEGA)

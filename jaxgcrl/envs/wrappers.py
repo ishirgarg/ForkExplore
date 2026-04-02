@@ -235,7 +235,6 @@ class GoExploreWrapper(Wrapper):
     - Resets obs/pipeline_state to the start-of-training state after the
       explore phase (or on episode done).
     - Updates ``go_goal`` from ``proposed_goals`` when a new go phase begins.
-    - Stores ``explore_first_obs`` (obs at go-phase start) for explore reward.
     - Sets ``truncation=1`` at phase boundaries so trajectory boundaries are
       respected in the replay buffer.
 
@@ -278,8 +277,6 @@ class GoExploreWrapper(Wrapper):
         # can restore it across go phases without manual pipeline-state surgery.
         state.info['first_start'] = state.obs[:, self.goal_indices]
         state.info['first_obs']           = state.obs
-        state.info['explore_first_obs']   = state.obs
-        state.info['pre_reset_obs']       = state.obs
         state.info['traj_id']             = jnp.zeros(num_envs, dtype=jnp.float32)
         state.info['proposed_goals']      = go_goal
         # Cumulative counters for Bug 2 (never reset within step, only in reset)
@@ -325,7 +322,10 @@ class GoExploreWrapper(Wrapper):
         should_reset = should_explore_to_go | ep_done
 
         # ── 5. Go-phase success metrics ───────────────────────────────────────────
-        go_success = in_go & goal_reached
+        # Only count a success when the go phase actually completes normally
+        # (should_go_to_explore), NOT when ep_done steals the transition.
+        # Otherwise go_successes_total can exceed go_completions_total.
+        go_success = should_go_to_explore & goal_reached
         # Point-in-time snapshot fields (kept for backward compat / debugging)
         new_go_phase_success = jnp.where(
             should_go_to_explore,
@@ -377,14 +377,7 @@ class GoExploreWrapper(Wrapper):
         proposed_goals = state.info.get('proposed_goals', state.info['go_goal'])
         new_go_goal = jnp.where(should_reset[:, None], proposed_goals, state.info['go_goal'])
 
-        # ── 9. Update explore_first_obs on go→explore ─────────────────────────────
-        new_explore_first_obs = jnp.where(
-            should_go_to_explore[:, None],
-            state.info['first_obs'],
-            state.info['explore_first_obs'],
-        )
-
-        # ── 10. Restore physics to start state on reset via proper env.reset() ──────
+        # ── 9. Restore physics to start state on reset via proper env.reset() ──────
         # Bug 1 fix: instead of restoring cached pipeline state (which has the
         # original goal baked into q), call env.reset(start=first_start, goal=new_goal)
         # so pipeline_init regenerates correct q/qd with the new goal embedded.
@@ -413,12 +406,12 @@ class GoExploreWrapper(Wrapper):
         # first_obs for the new go phase now has the correct goal baked in
         new_first_obs = jnp.where(should_reset[:, None], reset_state.obs, state.info['first_obs'])
 
-        # ── 11. Mark phase boundaries as truncations ─────────────────────────────
+        # ── 10. Mark phase boundaries as truncations ─────────────────────────────
         phase_boundary = (should_go_to_explore | should_reset).astype(jnp.float32)
         existing_trunc = info.get('truncation', jnp.zeros(phase.shape, dtype=jnp.float32))
         info['truncation'] = jnp.maximum(existing_trunc, phase_boundary)
 
-        # ── 12. Write updated fields back to info ────────────────────────────────
+        # ── 11. Write updated fields back to info ────────────────────────────────
         info['phase']                   = new_phase
         info['phase_step']              = new_phase_step
         info['traj_id']                 = traj_id
@@ -428,10 +421,8 @@ class GoExploreWrapper(Wrapper):
         info['go_completions_total']    = new_go_completions_total
         info['go_successes_total']      = new_go_successes_total
         info['go_success_steps_total']  = new_go_success_steps_total
-        info['explore_first_obs']       = new_explore_first_obs
         info['first_obs']               = new_first_obs
         info['first_start']             = first_start   # unchanged, carry forward
         info['proposed_goals']          = proposed_goals
-        info['pre_reset_obs']           = nstate.obs
 
         return nstate.replace(pipeline_state=reset_pipeline_state, obs=reset_obs, info=info)

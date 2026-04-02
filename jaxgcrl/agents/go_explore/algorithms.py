@@ -1,4 +1,3 @@
-import functools
 from typing import Any, Dict, Tuple
 
 import flax.linen as nn
@@ -17,6 +16,7 @@ from .losses import (
 from .networks import Actor as ActorNetwork, Encoder, QNetwork
 from .types import Actor, Critic, TrainingState, Transition
 from .utils import flatten_batch
+
 
 
 def _reshape_and_permute_transitions(transitions: Transition, process_key: jnp.ndarray, batch_size: int):
@@ -417,83 +417,6 @@ class SACCritic(Critic):
                transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
         """Update critic for SAC."""
         return update_critic_sac(context, networks, transitions, training_state, key)
-
-
-class ExploreActor(Actor):
-    """Non-goal-conditioned Explore Actor that takes state_size input (SAC-based)."""
-
-    def __init__(self, action_size: int, network_width: int, network_depth: int,
-                 use_relu: bool, use_ln: bool):
-        self.network = ActorNetwork(
-            action_size=action_size,
-            network_width=network_width,
-            network_depth=network_depth,
-            skip_connections=0,
-            use_relu=use_relu,
-            use_ln=use_ln,
-        )
-
-    def __call__(self, x):
-        return self.network(x)
-
-    def init(self, key, x):
-        return self.network.init(key, x)
-
-    def apply(self, params, x):
-        return self.network.apply(params, x)
-
-    def sample_actions(self, params, obs, key, is_deterministic: bool = False):
-        means, log_stds = self.apply(params, obs)
-        is_det_jax = jnp.array(is_deterministic, dtype=bool)
-        actions = jax.lax.cond(
-            is_det_jax,
-            lambda: nn.tanh(means),
-            lambda: nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)),
-        )
-        return actions
-
-    def update(self, context, networks, transitions, training_state, key):
-        """Update explore actor using SAC actor update."""
-        return update_actor_sac(context, networks, transitions, training_state, key)
-
-    def process_transitions(self, transitions, process_key, batch_size, discounting, state_size,
-                            goal_indices, goal_reach_thresh, use_her):
-        """Process explore phase transitions: just reshape and permute (no HER, no flatten_batch)."""
-        return _reshape_and_permute_transitions(transitions, process_key, batch_size)
-
-
-def get_explore_policy(explore_policy_type: str, action_size: int, state_size: int,
-                       h_dim: int = 256, n_hidden: int = 4, use_relu: bool = False,
-                       use_ln: bool = True, n_critics: int = 2, **kwargs):
-    """Factory function to create a non-goal-conditioned explore policy.
-
-    The explore actor/critic take state_size input (not obs_size) since they are
-    non-goal-conditioned.
-
-    Returns:
-        Tuple of (explore_actor, explore_critic)
-    """
-    if explore_policy_type == "sac":
-        explore_actor = ExploreActor(
-            action_size=action_size,
-            network_width=h_dim,
-            network_depth=n_hidden,
-            use_relu=use_relu,
-            use_ln=use_ln,
-        )
-        # Explore critic takes state_size as obs_size (non-goal-conditioned)
-        explore_critic = SACCritic(
-            obs_size=state_size,
-            action_size=action_size,
-            network_width=h_dim,
-            network_depth=n_hidden,
-            use_relu=use_relu,
-            use_ln=use_ln,
-            n_critics=n_critics,
-        )
-        return explore_actor, explore_critic
-    else:
-        raise ValueError(f"Unknown explore_policy_type: {explore_policy_type}")
 
 
 def get_algorithm(agent_type: str, **kwargs):

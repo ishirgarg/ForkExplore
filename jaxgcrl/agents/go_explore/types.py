@@ -62,11 +62,6 @@ class TrainingState:
     policy_optimizer_state: Optional[Any] = None  # For SAC's policy optimizer
     q_optimizer_state: Optional[Any] = None  # For SAC's Q-network optimizer
     target_policy_params: Optional[Any] = None  # For SAC's target policy (if TD3-like)
-    # Go Explore explore policy fields
-    explore_actor_state: Optional[TrainState] = None
-    explore_critic_states: Optional[Tuple[TrainState, ...]] = None
-    explore_alpha_state: Optional[TrainState] = None
-    explore_target_critic_params: Optional[Any] = None
 
 
 class Transition(NamedTuple):
