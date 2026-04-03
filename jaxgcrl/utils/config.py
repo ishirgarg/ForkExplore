@@ -65,7 +65,8 @@ class RunConfig:
     # wandb logging
     exp_name: str = "run"
     log_wandb: bool = True
-    wandb_project_name: str = "jaxgcrl"
+    wandb_project_name: str = "ForkExplore"
+    wandb_entity: str = "ishir-collab"
     wandb_group: str = "."
 
     # online or offline

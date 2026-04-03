@@ -2,6 +2,8 @@ import logging
 import os
 import pickle
 import pprint
+import time
+import socket
 
 import tyro
 from brax.io import model
@@ -47,8 +49,16 @@ def main(config: Config):
 
     logging.info("Arguments:\n%s", pprint.pformat(info))
 
+    # Generate a unique experiment name by default if none was explicitly set
+    if config.run.exp_name == "run" or not config.run.exp_name:
+        unique_suffix = f"{int(time.time())}_{os.getpid()}_{socket.gethostname()}"
+        default_name = f"{config.run.env}_{unique_suffix}"
+        config = config.replace(run=config.run.replace(exp_name=default_name))
+        info["exp_name"] = config.run.exp_name
+
     wandb.init(
         project=config.run.wandb_project_name,
+        entity=config.run.wandb_entity,
         group=config.run.wandb_group,
         name=config.run.exp_name,
         config=info,
