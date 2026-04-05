@@ -48,7 +48,6 @@ from .goal_proposers import (
     create_goal_proposer,
     create_random_env_goals_proposer,
 )
-from .algorithms_utils import reconstruct_full_critic_params
 import numpy as np
 import os
 
@@ -610,7 +609,6 @@ class GoExplore:
         # ── Main training loop ────────────────────────────────────────────────
         training_walltime      = 0
         last_visualization_step = -1
-        last_value_snapshot_step = -1
         logging.info("starting training....")
 
         for ne in range(config.num_evals):
@@ -645,69 +643,6 @@ class GoExplore:
                 **metrics_dict,
             }
             current_step = int(training_state.env_steps.item())
-
-            # Periodic value snapshot every ~1M steps (always enabled)
-            if self.agent_type == "sac":
-                if current_step // 1_000_000 > last_value_snapshot_step // 1_000_000:
-                    # Use a run-specific subdirectory to avoid cross-run overwrites
-                    det_tag = "_det" if self.deterministic_go_phase else ""
-                    snapshot_dir = os.path.join(
-                        "./runs/value_snapshots",
-                        f"{config.exp_name}_{config.env}_{self.goal_proposer_name}{det_tag}",
-                    )
-                    os.makedirs(snapshot_dir, exist_ok=True)
-                    # Reset an eval env to get s0 (eval_env is vmapped → needs batched keys)
-                    snap_key, key = jax.random.split(key)
-                    reset_keys = jax.random.split(snap_key, config.num_eval_envs)
-                    eval_state = jax.jit(eval_env.reset)(rng=reset_keys)
-                    s0 = eval_state.obs
-                    # eval_state.obs shape: (num_eval_envs, obs_size) due to Vmap; use first env
-                    if len(s0.shape) == 2:
-                        s0 = s0[0]
-                    s0_state = np.array(s0[:state_size])
-                    # Sample transitions from buffer (do not mutate training buffer_state)
-                    _, trans = replay_buffer.sample(buffer_state)
-                    obs_sample = np.array(trans.observation)  # (E, T, obs)
-                    # Build w_states from state portion
-                    obs_flat = obs_sample.reshape(-1, obs_sample.shape[-1])
-                    w_states = obs_flat[:, :state_size]
-                    # Subsample for compute cost
-                    if w_states.shape[0] > 4096:
-                        sel_idx = np.random.default_rng(0).choice(w_states.shape[0], 4096, replace=False)
-                        w_states = w_states[sel_idx]
-                    # Construct obs = [s0, w_as_goal]
-                    goal_part = w_states[:, list(train_env.goal_indices)]
-                    s0_tiled = np.repeat(s0_state[None, :], goal_part.shape[0], axis=0)
-                    obs_for_value = np.concatenate([s0_tiled, goal_part], axis=1).astype(np.float32)
-                    # Actor deterministic actions
-                    actions = gcp_actor.sample_actions(
-                        training_state.actor_state.params,
-                        obs_for_value,
-                        jax.random.PRNGKey(0),
-                        is_deterministic=True,
-                    )
-                    # Critic Q per-critic
-                    critic_params_dict = {i: cs.params for i, cs in enumerate(training_state.critic_states)}
-                    full_params = reconstruct_full_critic_params(critic_params_dict)
-                    q_values = gcp_critic.apply(full_params, obs_for_value, actions)  # (N, n_critics)
-                    # Save
-                    out_path = os.path.join(snapshot_dir, f"step_{current_step}.npz")
-                    np.savez_compressed(
-                        out_path,
-                        s0_state=s0_state,
-                        w_states=w_states,
-                        q_values=np.array(q_values),
-                        goal_indices=np.array(list(train_env.goal_indices), dtype=np.int32),
-                    )
-                    params_out_path = os.path.join(snapshot_dir, f"step_{current_step}_params.pkl")
-                    save_params(
-                        params_out_path,
-                        {
-                            "actor_params": training_state.actor_state.params,
-                            "critic_params": full_params,
-                        },
-                    )
-                    last_value_snapshot_step = current_step
 
             metrics = evaluator.run_evaluation(training_state, metrics)
             logging.info("step: %d", current_step)
