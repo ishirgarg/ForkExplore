@@ -8,6 +8,9 @@ from jaxgcrl.agents.go_explore.visualization import (
 )
 
 
+_last_viz_env_steps_reset = -1
+
+
 def handle_reset_explore_visualization(
     dyn_log_np: dict,
     init_log_np: dict,
@@ -18,6 +21,7 @@ def handle_reset_explore_visualization(
     goal_proposer_name_initial: str,
     x_bounds,
     y_bounds,
+    env_steps: int = -1,
 ):
     """
     Host-side visualization for ResetExplore proposals.
@@ -25,6 +29,14 @@ def handle_reset_explore_visualization(
       for one selected environment (viz_idx).
     - Logs three heatmaps of proposed goals: initial-only, dynamic-only, combined.
     """
+    global _last_viz_env_steps_reset
+
+    # Throttle like GoExplore: only once per 1M env steps
+    if env_steps >= 0:
+        if _last_viz_env_steps_reset >= 0 and (env_steps - _last_viz_env_steps_reset) < 1_000_000:
+            return
+        _last_viz_env_steps_reset = env_steps
+
     # Select which proposer generated the goal for the visualized env
     viz_idx = int(np.asarray(viz_idx_np))
     init_mask = np.asarray(init_mask_np).astype(bool)

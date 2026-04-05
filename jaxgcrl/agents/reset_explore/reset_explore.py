@@ -334,7 +334,7 @@ class ResetExplore:
 
         # ── get_experience ──────────────────────────────────────────────
         def get_experience(actor_state, critic_states, env_state, buffer_state,
-                           key, experience_count, proposer_state,
+                           key, experience_count, proposer_state, viz_env_steps,
                            is_deterministic: bool):
             buffer_state, transitions_sample = replay_buffer.sample(buffer_state)
             proposer_state = proposer_state.replace(
@@ -397,20 +397,25 @@ class ResetExplore:
 
                 # Goal proposer visualisation:
                 def log_viz(
-                    dyn_log_np, init_log_np, goals_np, init_mask_np, viz_idx_np,
-                    gp_name, gp_name_init, x_b, y_b,
+                    dyn_log_np, init_log_np, goals_np, init_mask_np, viz_idx_np, viz_steps_np,
                 ):
                     handle_reset_explore_visualization(
-                        dyn_log_np, init_log_np, goals_np, init_mask_np, viz_idx_np,
-                        gp_name, gp_name_init, x_b, y_b,
+                        dyn_log_np,
+                        init_log_np,
+                        goals_np,
+                        init_mask_np,
+                        viz_idx_np,
+                        self.goal_proposer_name,
+                        self.goal_proposer_name_initial,
+                        np.asarray(unwrapped_env.x_bounds),
+                        np.asarray(unwrapped_env.y_bounds),
+                        int(viz_steps_np),
                     )
                     return np.int32(0)
 
                 jax.experimental.io_callback(
                     log_viz, jnp.array(0, dtype=jnp.int32),
-                    dyn_goal_log, init_goal_log, new_goals, init_mask, viz_env_idx,
-                    self.goal_proposer_name, self.goal_proposer_name_initial,
-                    unwrapped_env.x_bounds, unwrapped_env.y_bounds,
+                    dyn_goal_log, init_goal_log, new_goals, init_mask, viz_env_idx, viz_env_steps,
                 )
 
                 return (
@@ -456,7 +461,7 @@ class ResetExplore:
                 k, new_k = jax.random.split(k)
                 es, bs, ec, ps = get_experience(
                     ts.actor_state, ts.critic_states, es, bs, k,
-                    ts.experience_count, ps, is_deterministic=False,
+                    ts.experience_count, ps, ts.env_steps, is_deterministic=False,
                 )
                 ts = ts.replace(
                     env_steps=ts.env_steps + config.num_envs * self.unroll_length,
@@ -542,7 +547,7 @@ class ResetExplore:
             env_state, buffer_state, updated_ec, updated_ps = get_experience(
                 training_state.actor_state, training_state.critic_states,
                 env_state, buffer_state, exp_key,
-                training_state.experience_count, proposer_state,
+                training_state.experience_count, proposer_state, training_state.env_steps,
                 is_deterministic=False,
             )
             training_state = training_state.replace(
