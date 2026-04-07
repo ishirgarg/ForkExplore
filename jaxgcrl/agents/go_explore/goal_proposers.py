@@ -324,12 +324,16 @@ def create_max_critic_to_env_goal_proposer(
     critic: Optional[Any] = None,
 ) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
     """
-    Create a goal proposer that:
+    Create a proposer that:
     1. Chooses a random environment goal g
     2. Samples num_candidates states w from the replay buffer
     3. For each candidate state w, computes mean Q(w, g) across the critic ensemble
     4. Selects the state w that maximizes mean Q(w, g)
-    5. Returns the random environment goal g
+    5. Returns the selected state's goal coordinates (w_goal)
+
+    Note:
+    - This is useful as a reset proposer (resetting to high-value buffer states).
+    - `env_goal` is still logged in `log_data` for visualization/debugging.
     """
     possible_goals = env.possible_goals  # Shape: (num_goals, goal_dim)
     num_goals = possible_goals.shape[0]  # Use .shape[0] for JIT compatibility

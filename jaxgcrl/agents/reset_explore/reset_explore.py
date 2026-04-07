@@ -356,7 +356,9 @@ class ResetExplore:
             def propose_new(env_state, key, info, experience_count, proposer_state):
                 viz_key, goal_key, reset_key, prob_key, init_start_key = jax.random.split(key, 5)
                 viz_env_idx = jax.random.randint(viz_key, (), 0, num_envs_)
-                goal_keys = jax.random.split(goal_key, num_envs_)
+                goal_key_dyn, goal_key_init = jax.random.split(goal_key)
+                goal_keys_dyn = jax.random.split(goal_key_dyn, num_envs_)
+                goal_keys_init = jax.random.split(goal_key_init, num_envs_)
                 reset_keys = jax.random.split(reset_key, num_envs_)
                 init_start_keys = jax.random.split(init_start_key, num_envs_)
                 first_obs = info['first_obs']
@@ -374,10 +376,10 @@ class ResetExplore:
 
                 dyn_goals, dyn_goal_log = jax.vmap(
                     _propose_goal_dyn, in_axes=(0, 0, None),
-                )(goal_keys, first_obs, proposer_state)
+                )(goal_keys_dyn, first_obs, proposer_state)
                 init_goals, init_goal_log = jax.vmap(
                     _propose_goal_init, in_axes=(0, 0, None),
-                )(goal_keys, first_obs, proposer_state)
+                )(goal_keys_init, first_obs, proposer_state)
 
                 # Propose starts (reset positions)
                 def _propose_start(rng, obs, state):
@@ -397,12 +399,13 @@ class ResetExplore:
 
                 # Goal proposer visualisation:
                 def log_viz(
-                    dyn_log_np, init_log_np, goals_np, init_mask_np, viz_idx_np, viz_steps_np,
+                    dyn_log_np, init_log_np, goals_np, starts_np, init_mask_np, viz_idx_np, viz_steps_np,
                 ):
                     handle_reset_explore_visualization(
                         dyn_log_np,
                         init_log_np,
                         goals_np,
+                        starts_np,
                         init_mask_np,
                         viz_idx_np,
                         self.goal_proposer_name,
@@ -415,7 +418,7 @@ class ResetExplore:
 
                 jax.experimental.io_callback(
                     log_viz, jnp.array(0, dtype=jnp.int32),
-                    dyn_goal_log, init_goal_log, new_goals, init_mask, viz_env_idx, viz_env_steps,
+                    dyn_goal_log, init_goal_log, new_goals, new_starts, init_mask, viz_env_idx, viz_env_steps,
                 )
 
                 return (
@@ -425,13 +428,14 @@ class ResetExplore:
                 )
 
             def keep_existing(env_state, key, info, experience_count, proposer_state):
-                return env_state, info, experience_count + 1, proposer_state
+                return env_state, info, experience_count, proposer_state
 
             # ---------------------------------------------------------
+            key, propose_key, rollout_key = jax.random.split(key, 3)
             env_state, info, updated_ec, updated_ps = jax.lax.cond(
                 new_experience_count >= reset_threshold,
                 propose_new, keep_existing,
-                env_state, key, info, experience_count, proposer_state,
+                env_state, propose_key, info, new_experience_count, proposer_state,
             )
             env_state = env_state.replace(info=info)
 
@@ -447,7 +451,7 @@ class ResetExplore:
                 return (env_state, buffer_state, next_k), transition
 
             (env_state, buffer_state, _), data = jax.lax.scan(
-                f, (env_state, buffer_state, key), (), length=self.unroll_length,
+                f, (env_state, buffer_state, rollout_key), (), length=self.unroll_length,
             )
             buffer_state = replay_buffer.insert(buffer_state, data)
             return env_state, buffer_state, updated_ec, updated_ps

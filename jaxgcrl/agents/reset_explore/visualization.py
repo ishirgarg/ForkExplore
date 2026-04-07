@@ -15,6 +15,7 @@ def handle_reset_explore_visualization(
     dyn_log_np: dict,
     init_log_np: dict,
     goals_np,
+    starts_np,
     init_mask_np,
     viz_idx_np,
     goal_proposer_name: str,
@@ -56,8 +57,9 @@ def handle_reset_explore_visualization(
         env_steps=-1,
     )
 
-    # Build three heatmaps for proposed goals
+    # Build three heatmaps for proposed goals and proposed reset starts
     goals = np.asarray(goals_np)
+    starts = np.asarray(starts_np)
     x_bounds = np.asarray(x_bounds)
     y_bounds = np.asarray(y_bounds)
 
@@ -67,6 +69,13 @@ def handle_reset_explore_visualization(
     else:
         init_goals_np = goals[init_mask]
         dyn_goals_np = goals[~init_mask]
+
+    if starts.size == 0:
+        init_starts_np = np.zeros((0, 2))
+        dyn_starts_np = np.zeros((0, 2))
+    else:
+        init_starts_np = starts[init_mask]
+        dyn_starts_np = starts[~init_mask]
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     plot_positions_with_heatmap(
@@ -103,3 +112,37 @@ def handle_reset_explore_visualization(
     wandb.log({"reset_explore/proposed_goals_heatmaps": wandb.Image(fig)})
     plt.close(fig)
 
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    plot_positions_with_heatmap(
+        init_starts_np,
+        x_bounds,
+        y_bounds,
+        title=f"Proposed reset starts — initial resets (n={len(init_starts_np)})",
+        ax=axes[0],
+        alpha_points=0.4,
+        alpha_heatmap=0.55,
+        point_size=2.0,
+    )
+    plot_positions_with_heatmap(
+        dyn_starts_np,
+        x_bounds,
+        y_bounds,
+        title=f"Proposed reset starts — dynamic resets (n={len(dyn_starts_np)})",
+        ax=axes[1],
+        alpha_points=0.4,
+        alpha_heatmap=0.55,
+        point_size=2.0,
+    )
+    plot_positions_with_heatmap(
+        starts,
+        x_bounds,
+        y_bounds,
+        title=f"Proposed reset starts — combined (n={len(starts)})",
+        ax=axes[2],
+        alpha_points=0.25,
+        alpha_heatmap=0.45,
+        point_size=1.5,
+    )
+    plt.tight_layout()
+    wandb.log({"reset_explore/proposed_starts_heatmaps": wandb.Image(fig)})
+    plt.close(fig)
