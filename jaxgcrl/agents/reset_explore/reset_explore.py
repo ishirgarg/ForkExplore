@@ -110,11 +110,12 @@ class ResetExplore:
     # Probability an env resets from the original initial-state distribution
     # instead of using the reset proposer (per-reset Bernoulli).
     p_initial_reset: float = 0.0
-    # Separate goal proposer for initial-distribution resets (defaults to same family)
-    goal_proposer_name_initial: Literal[
+    # Separate goal proposer for initial-distribution resets.
+    # If None, defaults to goal_proposer_name.
+    goal_proposer_name_initial: Optional[Literal[
         "random_env_goals", "rb", "q_epistemic", "ucgr",
         "max_critic_to_env", "mega", "omega",
-    ] = "random_env_goals"
+    ]] = None
     num_candidates: int = 512
 
     def check_config(self, config):
@@ -234,9 +235,14 @@ class ResetExplore:
             goal_indices=unwrapped_env.goal_indices,
             actor=actor, critic=critic, discounting=self.discounting,
         )
-        # Separate goal proposer for initial resets
+        # Separate goal proposer for initial resets (defaults to main goal proposer)
+        initial_goal_proposer_name = (
+            self.goal_proposer_name_initial
+            if self.goal_proposer_name_initial is not None
+            else self.goal_proposer_name
+        )
         init_goal_proposer = create_goal_proposer(
-            self.goal_proposer_name_initial, unwrapped_env, config.num_envs,
+            initial_goal_proposer_name, unwrapped_env, config.num_envs,
             self.num_candidates,
             state_size=state_size,
             goal_indices=unwrapped_env.goal_indices,
@@ -409,7 +415,7 @@ class ResetExplore:
                         init_mask_np,
                         viz_idx_np,
                         self.goal_proposer_name,
-                        self.goal_proposer_name_initial,
+                        initial_goal_proposer_name,
                         np.asarray(unwrapped_env.x_bounds),
                         np.asarray(unwrapped_env.y_bounds),
                         int(viz_steps_np),
