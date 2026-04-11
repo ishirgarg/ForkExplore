@@ -3,13 +3,23 @@
 Resets to a state provided by a *reset_proposer* (same API as goal proposers)
 and rolls out the goal-conditioned policy toward a goal from a
 *goal_proposer*.  There are no go/explore phases — just normal policy
-rollouts with auto-reset on episode truncation.
+rollouts with auto-reset on episode truncation. During training, with
+probability ``eps_random_action``, actions are uniform in [-1, 1] (same idea
+as the explore phase in GoExplore).
+
+Training collects ``episode_length`` env steps per parallel episode in chunks of
+``unroll_length``. At each episode start, starts are proposed first, then goals
+conditioned on those starts. Without ``fork_type``, new proposals are written to
+``info`` only and ``ResetExploreAutoResetWrapper`` performs resets on ``done``.
+With ``fork_type``, the same proposal step uses a hard ``reset``, and between
+chunks (except the last of an episode) the population is fork-resampled with
+unchanged goals.
 """
 
 import logging
 import random
 import time
-from typing import Callable, Literal, Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -48,6 +58,8 @@ from jaxgcrl.agents.go_explore.visualization import (
 from jaxgcrl.agents.reset_explore.visualization import (
     handle_reset_explore_visualization,
 )
+from jaxgcrl.agents.reset_explore.fork_algo import create_fork_fn
+from jaxgcrl.agents.reset_explore.visualization import maybe_log_fork_state_redistribution
 from jaxgcrl.agents.go_explore.goal_proposers import (
     create_goal_proposer,
     create_random_env_goals_proposer,
@@ -62,10 +74,17 @@ State = Union[envs.State, envs_v1.State]
 class ResetExplore:
     """Reset Explore agent.
 
-    At each episode boundary the environment resets to a position chosen by
-    ``reset_proposer`` and pursues a goal chosen by ``goal_proposer``.
-    Both proposers share the standard goal-proposer API, so any goal proposer
-    can serve as a reset proposer and vice-versa.
+    At each proposal step, ``reset_proposer`` chooses the start first; then
+    ``goal_proposer`` runs on an observation whose state slice encodes that start
+    (indices ``goal_indices``), so goals are conditioned on the chosen reset.
+    Without forking, episode-start proposals update ``info``; the auto-reset
+    wrapper applies them on env ``done``. With forking, episode start uses a
+    hard environment reset after proposing. Both proposers share the standard
+    goal-proposer API, so
+    any goal proposer can serve as a reset proposer and vice-versa.
+
+    Set ``fork_type`` to resample states between unroll chunks within an episode;
+    leave ``None`` for the same episode structure without redistribution.
     """
 
     agent_type: Literal["sac", "crl"] = "crl"
@@ -118,8 +137,21 @@ class ResetExplore:
     ]] = None
     num_candidates: int = 512
 
+    # Uniform random action with this probability during training (not eval).
+    eps_random_action: float = 0.1
+
+    # ForkExplore mode (None = disabled; e.g. "smc" for softmax resampling).
+    fork_type: Optional[str] = None
+    fork_sampling_temperature: float = 1.0
+    exploration_metric_name: str = "q_epistemic"
+    fork_viz_interval: int = 500_000
+
     def check_config(self, config):
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0
+        assert config.episode_length % self.unroll_length == 0, (
+            "episode_length must be divisible by unroll_length "
+            "(rollouts are episode_length env steps in unroll_length chunks)."
+        )
 
     # --------------------------------------------------------------------- #
     # train_fn
@@ -139,6 +171,7 @@ class ResetExplore:
         state_size = train_env.state_dim
         goal_size = len(train_env.goal_indices)
         obs_size = state_size + goal_size
+        goal_idx_arr = jnp.array(unwrapped_env.goal_indices)
 
         # ── Wrap envs ───────────────────────────────────────────────────
         train_env = TrajectoryIdWrapper(train_env)
@@ -319,14 +352,73 @@ class ResetExplore:
             critic_params={i: cs.params for i, cs in enumerate(critic_states)},
         )
 
+        use_fork = self.fork_type is not None
+        if use_fork:
+            fork_fn, fork_metric_fn = create_fork_fn(
+                self.fork_type,
+                unwrapped_env,
+                config.num_envs,
+                self.num_candidates,
+                state_size=state_size,
+                goal_indices=tuple(int(i) for i in unwrapped_env.goal_indices),
+                actor=actor,
+                critic=critic,
+                exploration_metric_name=self.exploration_metric_name,
+                fork_sampling_temperature=self.fork_sampling_temperature,
+                discounting=self.discounting,
+            )
+            goal_idx_np = np.asarray(unwrapped_env.goal_indices, dtype=np.int32)
+            fork_viz_x_bounds = (
+                np.asarray(unwrapped_env.x_bounds)
+                if hasattr(unwrapped_env, "x_bounds")
+                else None
+            )
+            fork_viz_y_bounds = (
+                np.asarray(unwrapped_env.y_bounds)
+                if hasattr(unwrapped_env, "y_bounds")
+                else None
+            )
+
+            def fork_viz_host(before, after, exploration_values, steps):
+                b = np.asarray(before)[:, goal_idx_np]
+                a = np.asarray(after)[:, goal_idx_np]
+                ev = np.asarray(exploration_values)
+                maybe_log_fork_state_redistribution(
+                    b,
+                    a,
+                    ev,
+                    int(np.asarray(steps)),
+                    self.fork_viz_interval,
+                    x_bounds=fork_viz_x_bounds,
+                    y_bounds=fork_viz_y_bounds,
+                )
+                return np.int32(0)
+        else:
+            fork_fn = None
+            fork_metric_fn = None
+            fork_viz_host = None
+
         # ── actor_step ──────────────────────────────────────────────────
         def actor_step(actor_state, env, env_state, key, extra_fields,
                        is_deterministic: bool):
-            action_key, env_rng = jax.random.split(key)
-            actions = actor.sample_actions(
+            key, action_key, random_key, eps_key, env_rng = jax.random.split(key, 5)
+            policy_actions = actor.sample_actions(
                 actor_state.params, env_state.obs, action_key,
                 is_deterministic=is_deterministic,
             )
+            # Same pattern as GoExplore: logical_and masks epsilon (there: in_explore;
+            # here: stochastic training rollouts only, not eval).
+            random_actions = jax.random.uniform(
+                random_key, shape=policy_actions.shape, minval=-1.0, maxval=1.0
+            )
+            use_random = jax.random.uniform(
+                eps_key, shape=(policy_actions.shape[0],),
+            ) < self.eps_random_action
+            allow_eps = jnp.logical_not(
+                jnp.asarray(is_deterministic, dtype=jnp.bool_)
+            )
+            use_random = jnp.logical_and(allow_eps, use_random)
+            actions = jnp.where(use_random[:, None], random_actions, policy_actions)
             nstate = env.step(env_state, actions, env_rng)
             state_extras = {x: nstate.info[x] for x in extra_fields}
             return nstate, Transition(
@@ -339,9 +431,18 @@ class ResetExplore:
             )
 
         # ── get_experience ──────────────────────────────────────────────
-        def get_experience(actor_state, critic_states, env_state, buffer_state,
-                           key, experience_count, proposer_state, viz_env_steps,
-                           is_deterministic: bool):
+        def get_experience(
+            actor_state,
+            critic_states,
+            env_state,
+            buffer_state,
+            key,
+            experience_count,
+            proposer_state,
+            viz_env_steps,
+            macro_step,
+            is_deterministic: bool,
+        ):
             buffer_state, transitions_sample = replay_buffer.sample(buffer_state)
             proposer_state = proposer_state.replace(
                 transitions_sample=transitions_sample,
@@ -351,59 +452,84 @@ class ResetExplore:
 
             num_envs_ = config.num_envs
             episode_length = config.episode_length
-            info = dict(env_state.info)
 
-            reset_threshold = jnp.array(
-                episode_length // (self.unroll_length * 2), dtype=jnp.int32,
-            )
-            new_experience_count = experience_count + 1
+            @jax.jit
+            def rollout_scan(carry, _):
+                es, bs, k = carry
+                k, next_k = jax.random.split(k)
+                es, transition = actor_step(
+                    actor_state, train_env, es, k,
+                    extra_fields=("truncation", "traj_id"),
+                    is_deterministic=is_deterministic,
+                )
+                return (es, bs, next_k), transition
 
-            # ---------------------------------------------------------
-            def propose_new(env_state, key, info, experience_count, proposer_state):
-                viz_key, goal_key, reset_key, prob_key, init_start_key = jax.random.split(key, 5)
+            def propose_goals_and_starts(proposal_key, first_obs, ps):
+                viz_key, goal_key, reset_key, prob_key, init_start_key = jax.random.split(
+                    proposal_key, 5,
+                )
                 viz_env_idx = jax.random.randint(viz_key, (), 0, num_envs_)
                 goal_key_dyn, goal_key_init = jax.random.split(goal_key)
                 goal_keys_dyn = jax.random.split(goal_key_dyn, num_envs_)
                 goal_keys_init = jax.random.split(goal_key_init, num_envs_)
                 reset_keys = jax.random.split(reset_key, num_envs_)
                 init_start_keys = jax.random.split(init_start_key, num_envs_)
-                first_obs = info['first_obs']
 
-                # Bernoulli mask for initial-distribution resets
-                init_mask = (jax.random.uniform(prob_key, (num_envs_,)) < self.p_initial_reset)
+                init_mask = jax.random.uniform(prob_key, (num_envs_,)) < self.p_initial_reset
 
-                # Propose goals: both variants (initial/dynamic)
+                def _propose_start(rng, obs, state):
+                    start, _, _ = reset_proposer(rng, obs, state)
+                    return start
+
+                dyn_starts = jax.vmap(
+                    _propose_start, in_axes=(0, 0, None),
+                )(reset_keys, first_obs, ps)
+                init_starts = jax.vmap(random_start_fn)(init_start_keys)
+                new_starts = jnp.where(init_mask[:, None], init_starts, dyn_starts)
+
+                def _goal_obs_for_proposer(template_obs, start_pos):
+                    """Observation passed to goal proposers encodes the chosen reset start."""
+                    state_part = template_obs[:state_size]
+                    updated_state = state_part.at[goal_idx_arr].set(start_pos)
+                    return jnp.concatenate(
+                        [updated_state, template_obs[state_size:]], axis=-1,
+                    )
+
+                goal_input_obs = jax.vmap(_goal_obs_for_proposer)(first_obs, new_starts)
+
                 def _propose_goal_dyn(rng, obs, state):
                     goal, _, log_data = goal_proposer(rng, obs, state)
                     return goal, log_data
+
                 def _propose_goal_init(rng, obs, state):
                     goal, _, log_data = init_goal_proposer(rng, obs, state)
                     return goal, log_data
 
                 dyn_goals, dyn_goal_log = jax.vmap(
                     _propose_goal_dyn, in_axes=(0, 0, None),
-                )(goal_keys_dyn, first_obs, proposer_state)
+                )(goal_keys_dyn, goal_input_obs, ps)
                 init_goals, init_goal_log = jax.vmap(
                     _propose_goal_init, in_axes=(0, 0, None),
-                )(goal_keys_init, first_obs, proposer_state)
+                )(goal_keys_init, goal_input_obs, ps)
 
-                # Propose starts (reset positions)
-                def _propose_start(rng, obs, state):
-                    start, _, _ = reset_proposer(rng, obs, state)
-                    return start
-                dyn_starts = jax.vmap(
-                    _propose_start, in_axes=(0, 0, None),
-                )(reset_keys, first_obs, proposer_state)
-                init_starts = jax.vmap(random_start_fn)(init_start_keys)
-
-                # Select per-env based on init_mask
                 new_goals = jnp.where(init_mask[:, None], init_goals, dyn_goals)
-                new_starts = jnp.where(init_mask[:, None], init_starts, dyn_starts)
+                return (
+                    new_goals,
+                    new_starts,
+                    dyn_goal_log,
+                    init_goal_log,
+                    init_mask,
+                    viz_env_idx,
+                )
 
-                info['proposed_goals'] = new_goals
-                info['proposed_starts'] = new_starts
-
-                # Goal proposer visualisation:
+            def emit_proposal_visualization(
+                dyn_goal_log,
+                init_goal_log,
+                new_goals,
+                new_starts,
+                init_mask,
+                viz_env_idx,
+            ):
                 def log_viz(
                     dyn_log_np, init_log_np, goals_np, starts_np, init_mask_np, viz_idx_np, viz_steps_np,
                 ):
@@ -424,64 +550,109 @@ class ResetExplore:
 
                 jax.experimental.io_callback(
                     log_viz, jnp.array(0, dtype=jnp.int32),
-                    dyn_goal_log, init_goal_log, new_goals, new_starts, init_mask, viz_env_idx, viz_env_steps,
+                    dyn_goal_log, init_goal_log, new_goals, new_starts,
+                    init_mask, viz_env_idx, viz_env_steps,
                 )
 
-                return (
-                    env_state, info,
-                    jnp.array(0, dtype=jnp.int32),
-                    proposer_state,
+            key, k_ep_start, k_roll, k_fork = jax.random.split(key, 4)
+
+            def run_episode_start(es, prop_key, ps):
+                inf = dict(es.info)
+                first_obs = inf["first_obs"]
+                sub_keys, rk_parent = jax.random.split(prop_key)
+                ng, ns, dgl, igl, imask, vidx = propose_goals_and_starts(
+                    sub_keys, first_obs, ps,
                 )
+                emit_proposal_visualization(dgl, igl, ng, ns, imask, vidx)
+                if use_fork:
+                    r_keys = jax.random.split(rk_parent, num_envs_)
+                    return train_env.reset(r_keys, goal=ng, start=ns)
+                inf["proposed_goals"] = ng
+                inf["proposed_starts"] = ns
+                return es.replace(info=inf)
 
-            def keep_existing(env_state, key, info, experience_count, proposer_state):
-                return env_state, info, experience_count, proposer_state
-
-            # ---------------------------------------------------------
-            key, propose_key, rollout_key = jax.random.split(key, 3)
-            env_state, info, updated_ec, updated_ps = jax.lax.cond(
-                new_experience_count >= reset_threshold,
-                propose_new, keep_existing,
-                env_state, propose_key, info, new_experience_count, proposer_state,
+            env_state = jax.lax.cond(
+                macro_step == 0,
+                lambda: run_episode_start(env_state, k_ep_start, proposer_state),
+                lambda: env_state,
             )
-            env_state = env_state.replace(info=info)
-
-            @jax.jit
-            def f(carry, _):
-                env_state, buffer_state, k = carry
-                k, next_k = jax.random.split(k)
-                env_state, transition = actor_step(
-                    actor_state, train_env, env_state, k,
-                    extra_fields=("truncation", "traj_id"),
-                    is_deterministic=is_deterministic,
-                )
-                return (env_state, buffer_state, next_k), transition
 
             (env_state, buffer_state, _), data = jax.lax.scan(
-                f, (env_state, buffer_state, rollout_key), (), length=self.unroll_length,
+                rollout_scan,
+                (env_state, buffer_state, k_roll),
+                (),
+                length=self.unroll_length,
             )
             buffer_state = replay_buffer.insert(buffer_state, data)
-            return env_state, buffer_state, updated_ec, updated_ps
+
+            macro_new = macro_step + self.unroll_length
+
+            if use_fork:
+
+                def fork_redistribute(es, bkey, ps):
+                    fk, rk, met_k = jax.random.split(bkey, 3)
+                    inf = dict(es.info)
+                    states_full = es.obs[:, :state_size]
+                    goals = inf["proposed_goals"]
+                    forked_full = fork_fn(fk, states_full, goals, ps)
+                    exploration_at_final = fork_metric_fn(
+                        met_k, forked_full, goals, ps,
+                    )
+                    new_starts = forked_full[:, goal_idx_arr]
+                    reset_keys = jax.random.split(rk, num_envs_)
+                    nstate = train_env.reset(reset_keys, goal=goals, start=new_starts)
+                    inf2 = dict(nstate.info)
+                    inf2["proposed_goals"] = goals
+                    inf2["proposed_starts"] = new_starts
+                    jax.experimental.io_callback(
+                        fork_viz_host,
+                        jnp.int32(0),
+                        states_full, forked_full, exploration_at_final, viz_env_steps,
+                    )
+                    return nstate.replace(info=inf2), macro_new
+
+                env_state, macro_out = jax.lax.cond(
+                    macro_new >= episode_length,
+                    lambda: (env_state, jnp.int32(0)),
+                    lambda: fork_redistribute(env_state, k_fork, proposer_state),
+                )
+            else:
+                env_state, macro_out = jax.lax.cond(
+                    macro_new >= episode_length,
+                    lambda: (env_state, jnp.int32(0)),
+                    lambda: (env_state, macro_new),
+                )
+
+            new_experience_count = experience_count + 1
+            return (
+                env_state,
+                buffer_state,
+                proposer_state,
+                new_experience_count,
+                macro_out,
+            )
 
         # ── prefill ─────────────────────────────────────────────────────
         def prefill_replay_buffer(training_state, env_state, buffer_state,
-                                  key, proposer_state):
+                                  key, proposer_state, macro_step):
             @jax.jit
             def f(carry, _):
-                ts, es, bs, k, ps = carry
+                ts, es, bs, k, ps, ms = carry
                 k, new_k = jax.random.split(k)
-                es, bs, ec, ps = get_experience(
+                es, bs, ps, ec, ms = get_experience(
                     ts.actor_state, ts.critic_states, es, bs, k,
-                    ts.experience_count, ps, ts.env_steps, is_deterministic=False,
+                    ts.experience_count, ps, ts.env_steps, ms,
+                    is_deterministic=False,
                 )
                 ts = ts.replace(
                     env_steps=ts.env_steps + config.num_envs * self.unroll_length,
                     experience_count=ec,
                 )
-                return (ts, es, bs, new_k, ps), ()
+                return (ts, es, bs, new_k, ps, ms), ()
 
             return jax.lax.scan(
                 f,
-                (training_state, env_state, buffer_state, key, proposer_state),
+                (training_state, env_state, buffer_state, key, proposer_state, macro_step),
                 (),
                 length=num_prefill_actor_steps,
             )[0]
@@ -551,13 +722,14 @@ class ResetExplore:
         # ── training_step ───────────────────────────────────────────────
         @jax.jit
         def training_step(training_state, env_state, buffer_state, key,
-                          proposer_state):
+                          proposer_state, macro_step):
             exp_key, process_key, train_key = jax.random.split(key, 3)
 
-            env_state, buffer_state, updated_ec, updated_ps = get_experience(
+            env_state, buffer_state, updated_ps, updated_ec, macro_next = get_experience(
                 training_state.actor_state, training_state.critic_states,
                 env_state, buffer_state, exp_key,
                 training_state.experience_count, proposer_state, training_state.env_steps,
+                macro_step,
                 is_deterministic=False,
             )
             training_state = training_state.replace(
@@ -574,36 +746,37 @@ class ResetExplore:
             (training_state, _), metrics = jax.lax.scan(
                 update_networks, (training_state, train_key), transitions,
             )
-            return (training_state, env_state, buffer_state, updated_ps), metrics
+            return (training_state, env_state, buffer_state, updated_ps, macro_next), metrics
 
         # ── training_epoch ──────────────────────────────────────────────
         @jax.jit
         def training_epoch(training_state, env_state, buffer_state, key,
-                           proposer_state):
+                           proposer_state, macro_step):
             @jax.jit
             def f(carry, _):
-                ts, es, bs, k, ps = carry
+                ts, es, bs, k, ps, ms = carry
                 k, train_key = jax.random.split(k)
-                (ts, es, bs, ps), metrics = training_step(
-                    ts, es, bs, train_key, ps,
+                (ts, es, bs, ps, ms), metrics = training_step(
+                    ts, es, bs, train_key, ps, ms,
                 )
-                return (ts, es, bs, k, ps), metrics
+                return (ts, es, bs, k, ps, ms), metrics
 
-            (training_state, env_state, buffer_state, key, proposer_state), metrics = jax.lax.scan(
+            (training_state, env_state, buffer_state, key, proposer_state, macro_step), metrics = jax.lax.scan(
                 f,
-                (training_state, env_state, buffer_state, key, proposer_state),
+                (training_state, env_state, buffer_state, key, proposer_state, macro_step),
                 (),
                 length=num_training_steps_per_epoch,
             )
             metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
-            return training_state, env_state, buffer_state, proposer_state, metrics
+            return training_state, env_state, buffer_state, proposer_state, macro_step, metrics
 
         # ── Prefill ─────────────────────────────────────────────────────
+        macro_init = jnp.int32(0)
         key, prefill_key = jax.random.split(key)
-        training_state, env_state, buffer_state, _, proposer_state = (
+        training_state, env_state, buffer_state, _, proposer_state, macro_step = (
             prefill_replay_buffer(
                 training_state, env_state, buffer_state,
-                prefill_key, proposer_state,
+                prefill_key, proposer_state, macro_init,
             )
         )
 
@@ -628,10 +801,10 @@ class ResetExplore:
             t = time.time()
             key, epoch_key = jax.random.split(key)
 
-            training_state, env_state, buffer_state, proposer_state, metrics = (
+            training_state, env_state, buffer_state, proposer_state, macro_step, metrics = (
                 training_epoch(
                     training_state, env_state, buffer_state,
-                    epoch_key, proposer_state,
+                    epoch_key, proposer_state, macro_step,
                 )
             )
 

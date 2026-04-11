@@ -2,7 +2,7 @@ import jax
 from brax.envs import PipelineEnv, State, Wrapper, Env
 from jax import numpy as jnp
 from jax import tree_util
-from typing import Callable, Any, Optional
+from typing import Callable, Any, Optional, Tuple
 
 class TrajectoryIdWrapper(Wrapper):
     def __init__(self, env: PipelineEnv):
@@ -233,15 +233,48 @@ class ResetExploreAutoResetWrapper(Wrapper):
     On episode done, resets the environment using ``proposed_goals`` and
     ``proposed_starts`` stored in ``state.info``.  The agent updates these
     fields before each unroll to steer where resets land.
+
+    If ``state_size`` and ``goal_indices`` are passed at construction, you may
+    call ``reset(rng, goal=None, start=None)`` so the underlying env samples
+    from its initial goal/start distributions; proposed fields are then read
+    back from ``state.obs`` (same layout as explicit ``goal`` / ``start``).
     """
 
-    def reset(self, rng: jax.Array, goal: jnp.ndarray,
-              start: jnp.ndarray) -> State:
+    def __init__(
+        self,
+        env: Env,
+        state_size: Optional[int] = None,
+        goal_indices: Optional[Tuple[int, ...]] = None,
+    ):
+        super().__init__(env)
+        self._state_size = state_size
+        self._goal_idx = None if goal_indices is None else jnp.array(goal_indices)
+
+    def reset(
+        self,
+        rng: jax.Array,
+        goal: Optional[jnp.ndarray] = None,
+        start: Optional[jnp.ndarray] = None,
+    ) -> State:
+        if goal is None or start is None:
+            if self._state_size is None or self._goal_idx is None:
+                raise ValueError(
+                    "ResetExploreAutoResetWrapper: pass state_size and goal_indices "
+                    "to __init__ when using reset(goal=None) or reset(start=None)."
+                )
         state = self.env.reset(rng, goal=goal, start=start)
-        state.info['proposed_goals'] = goal
-        state.info['proposed_starts'] = start
-        state.info['first_pipeline_state'] = state.pipeline_state
-        state.info['first_obs'] = state.obs
+        if goal is None:
+            proposed_goals = state.obs[:, self._state_size :]
+        else:
+            proposed_goals = goal
+        if start is None:
+            proposed_starts = state.obs[:, self._goal_idx]
+        else:
+            proposed_starts = start
+        state.info["proposed_goals"] = proposed_goals
+        state.info["proposed_starts"] = proposed_starts
+        state.info["first_pipeline_state"] = state.pipeline_state
+        state.info["first_obs"] = state.obs
         return state
 
     def step(self, state: State, action: jax.Array, rng: jax.Array) -> State:
