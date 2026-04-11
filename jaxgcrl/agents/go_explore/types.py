@@ -62,6 +62,17 @@ class TrainingState:
     policy_optimizer_state: Optional[Any] = None  # For SAC's policy optimizer
     q_optimizer_state: Optional[Any] = None  # For SAC's Q-network optimizer
     target_policy_params: Optional[Any] = None  # For SAC's target policy (if TD3-like)
+    # Explore policy fields (None when explore_policy_type is None)
+    explore_actor_state: Optional[TrainState] = None
+    explore_critic_states: Optional[Tuple[TrainState, ...]] = None
+    explore_alpha_state: Optional[TrainState] = None
+    explore_target_critic_params: Optional[Any] = None
+    # TLDR fields (None when explore_reward_type != "tldr")
+    te_state: Optional[TrainState] = None
+    dual_lam_state: Optional[TrainState] = None
+    pbe_rms_state: Optional[Any] = None
+    # PEG fields (None when neither explore_reward_type="peg" nor goal_proposer_name="peg")
+    wm_ensemble_states: Optional[Tuple[TrainState, ...]] = None
 
 
 class Transition(NamedTuple):
@@ -82,3 +93,5 @@ class GoalProposerState:
     transitions_sample: Any  # Transition sample from replay buffer
     actor_params: Optional[Any] = None  # Actor network parameters (for q_epistemic)
     critic_params: Optional[Any] = None  # Critic network parameters (for q_epistemic)
+    te_params: Optional[Any] = None  # Traj encoder parameters (for TLDR goal proposer)
+    wm_ensemble_params: Optional[Any] = None  # World model ensemble params (for PEG goal proposer)

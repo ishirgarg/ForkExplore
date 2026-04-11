@@ -74,20 +74,15 @@ class CRLActor(Actor):
     
     def sample_actions(self, params, obs, key, is_deterministic: bool = False):
         means, log_stds = self.apply(params, obs)
-        # Use JAX cond to select between deterministic and stochastic actions
-        is_det_jax = jnp.array(is_deterministic, dtype=bool)
-        actions = jax.lax.cond(
-            is_det_jax,
-            lambda: nn.tanh(means),  # Deterministic: just use mean
-            lambda: nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)),  # Stochastic: add noise
-        )
-        return actions
-    
+        if is_deterministic:
+            return nn.tanh(means)
+        return nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
+
     def apply(self, params, obs):
         """Apply actor network to get mean and log_std."""
         return self.network.apply(params, obs)
-    
-    def update(self, context: Dict[str, Any], networks: Dict[str, Any], 
+
+    def update(self, context: Dict[str, Any], networks: Dict[str, Any],
                transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
         """Update actor and alpha for CRL."""
         return crl_update_actor(context, networks, transitions, training_state, key)
@@ -102,13 +97,14 @@ class CRLActor(Actor):
             state_size,
             tuple(goal_indices),
         )
-        batch_keys = jax.random.split(process_key, transitions.observation.shape[0])
+        flatten_key, permute_key = jax.random.split(process_key)
+        batch_keys = jax.random.split(flatten_key, transitions.observation.shape[0])
         transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
             buffer_config, transitions, batch_keys
         )
-        
+
         # Use shared reshape and permute logic
-        return _reshape_and_permute_transitions(transitions, process_key, batch_size)
+        return _reshape_and_permute_transitions(transitions, permute_key, batch_size)
 
 
 class CRLCritic(Critic):
@@ -283,15 +279,10 @@ class SACActor(Actor):
     
     def sample_actions(self, params, obs, key, is_deterministic: bool = False):
         means, log_stds = self.apply(params, obs)
-        # Use JAX cond to select between deterministic and stochastic actions
-        is_det_jax = jnp.array(is_deterministic, dtype=bool)
-        actions = jax.lax.cond(
-            is_det_jax,
-            lambda: nn.tanh(means),  # Deterministic: just use mean
-            lambda: nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)),  # Stochastic: add noise
-        )
-        return actions
-    
+        if is_deterministic:
+            return nn.tanh(means)
+        return nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
+
     def update(self, context: Dict[str, Any], networks: Dict[str, Any],
                transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
         """Update actor for SAC."""

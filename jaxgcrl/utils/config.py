@@ -2,12 +2,12 @@ from typing import Literal, Optional, Union
 
 from flax.struct import dataclass
 
-from jaxgcrl.agents import Baseline, CRL, GoExplore, PPO, ResetExplore, SAC, TD3
+from jaxgcrl.agents import Baseline, CRL, GoExplore, PPO, SAC, TD3
 
 from .env import legal_envs
 
 # agent configurations
-AgentConfig = Union[Baseline, CRL, GoExplore, PPO, ResetExplore, SAC, TD3]
+AgentConfig = Union[Baseline, CRL, GoExplore, PPO, SAC, TD3]
 
 
 @dataclass

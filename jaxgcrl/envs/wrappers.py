@@ -227,131 +227,6 @@ class TrainAutoResetWrapper(Wrapper):
         return state.replace(pipeline_state=pipeline_state, obs=obs)
 
 
-class ResetExploreAutoResetWrapper(Wrapper):
-    """Auto-reset wrapper for Reset Explore.
-
-    On episode done, resets the environment using ``proposed_goals`` and
-    ``proposed_starts`` stored in ``state.info``.  The agent updates these
-    fields before each unroll to steer where resets land.
-
-    If ``state_size`` and ``goal_indices`` are passed at construction, you may
-    call ``reset(rng, goal=None, start=None)`` so the underlying env samples
-    from its initial goal/start distributions; proposed fields are then read
-    back from ``state.obs`` (same layout as explicit ``goal`` / ``start``).
-    """
-
-    def __init__(
-        self,
-        env: Env,
-        state_size: Optional[int] = None,
-        goal_indices: Optional[Tuple[int, ...]] = None,
-    ):
-        super().__init__(env)
-        self._state_size = state_size
-        self._goal_idx = None if goal_indices is None else jnp.array(goal_indices)
-
-    def reset(
-        self,
-        rng: jax.Array,
-        goal: Optional[jnp.ndarray] = None,
-        start: Optional[jnp.ndarray] = None,
-    ) -> State:
-        if goal is None or start is None:
-            if self._state_size is None or self._goal_idx is None:
-                raise ValueError(
-                    "ResetExploreAutoResetWrapper: pass state_size and goal_indices "
-                    "to __init__ when using reset(goal=None) or reset(start=None)."
-                )
-        state = self.env.reset(rng, goal=goal, start=start)
-        if goal is None:
-            proposed_goals = state.obs[:, self._state_size :]
-        else:
-            proposed_goals = goal
-        if start is None:
-            proposed_starts = state.obs[:, self._goal_idx]
-        else:
-            proposed_starts = start
-        state.info["proposed_goals"] = proposed_goals
-        state.info["proposed_starts"] = proposed_starts
-        state.info["first_pipeline_state"] = state.pipeline_state
-        state.info["first_obs"] = state.obs
-        return state
-
-    def step(self, state: State, action: jax.Array, rng: jax.Array) -> State:
-        if 'steps' in state.info:
-            steps = state.info['steps']
-            steps = jnp.where(state.done, jnp.zeros_like(steps), steps)
-            state.info.update(steps=steps)
-        state = state.replace(done=jnp.zeros_like(state.done))
-        state = self.env.step(state, action)
-
-        done = state.done
-
-        def reset_done_envs(state, done, info, rng):
-            num_envs = done.shape[0] if done.shape else 1
-            reset_rng = jax.random.split(rng, num_envs)
-            proposed_goals = info['proposed_goals']
-            proposed_starts = info['proposed_starts']
-            reset_state = self.env.reset(
-                reset_rng, goal=proposed_goals, start=proposed_starts,
-            )
-
-            def where_done_reset(x_reset, x_current):
-                if x_reset.shape and x_reset.shape[0] != done.shape[0]:
-                    return x_current
-                if done.shape:
-                    done_reshaped = jnp.reshape(
-                        done, [done.shape[0]] + [1] * (len(x_reset.shape) - 1)
-                    )
-                else:
-                    done_reshaped = done
-                return jnp.where(done_reshaped, x_reset, x_current)
-
-            info['first_pipeline_state'] = jax.tree.map(
-                where_done_reset,
-                reset_state.pipeline_state,
-                info.get('first_pipeline_state', state.pipeline_state),
-            )
-            info['first_obs'] = jax.tree.map(
-                where_done_reset,
-                reset_state.obs,
-                info.get('first_obs', state.obs),
-            )
-            info['traj_id'] = jax.tree.map(
-                where_done_reset,
-                reset_state.info['traj_id'],
-                info.get('traj_id', state.info.get('traj_id')),
-            )
-            info['proposed_goals'] = proposed_goals
-            info['proposed_starts'] = proposed_starts
-            return state.replace(info=info)
-
-        def no_reset(state, done, info, rng):
-            return state.replace(info=info)
-
-        info = dict(state.info)
-        state = jax.lax.cond(
-            jnp.any(done), reset_done_envs, no_reset,
-            state, done, info, rng,
-        )
-
-        def where_done(x, y):
-            done = state.done
-            if done.shape and done.shape[0] != x.shape[0]:
-                return y
-            if done.shape:
-                done = jnp.reshape(
-                    done, [x.shape[0]] + [1] * (len(x.shape) - 1)
-                )
-            return jnp.where(done, x, y)
-
-        pipeline_state = jax.tree.map(
-            where_done, state.info['first_pipeline_state'], state.pipeline_state,
-        )
-        obs = jax.tree.map(where_done, state.info['first_obs'], state.obs)
-        return state.replace(pipeline_state=pipeline_state, obs=obs)
-
-
 class GoExploreWrapper(Wrapper):
     """Outermost training wrapper for the Go Explore algorithm.
 
@@ -405,6 +280,8 @@ class GoExploreWrapper(Wrapper):
         state.info['first_obs']           = state.obs
         state.info['traj_id']             = jnp.zeros(num_envs, dtype=jnp.float32)
         state.info['proposed_goals']      = go_goal
+        # proposed_starts: if set by reset proposer, used instead of first_start
+        state.info['proposed_starts']     = state.obs[:, self.goal_indices]
         # Cumulative counters for Bug 2 (never reset within step, only in reset)
         state.info['go_completions_total']   = jnp.zeros(num_envs, dtype=jnp.float32)
         state.info['go_successes_total']     = jnp.zeros(num_envs, dtype=jnp.float32)
@@ -504,17 +381,13 @@ class GoExploreWrapper(Wrapper):
         new_go_goal = jnp.where(should_reset[:, None], proposed_goals, state.info['go_goal'])
 
         # ── 9. Restore physics to start state on reset via proper env.reset() ──────
-        # Bug 1 fix: instead of restoring cached pipeline state (which has the
-        # original goal baked into q), call env.reset(start=first_start, goal=new_goal)
-        # so pipeline_init regenerates correct q/qd with the new goal embedded.
-        # This matches how TrainAutoResetWrapper resets via the env API.
-        first_start = state.info['first_start']   # (num_envs, 2) — ant xy at episode start
+        # Use proposed_starts (from reset proposer) if available, else first_start
+        reset_start = state.info.get('proposed_starts', state.info['first_start'])
         num_envs_local = state.obs.shape[0]
-        # Split rng for per-env resets (rng may be a single key from actor_step)
         reset_rng = jax.random.split(rng, num_envs_local)  # (num_envs, 2)
         # Reset ALL envs unconditionally (JAX traces the branch regardless);
         # _where_masked selects results only for envs where should_reset is True.
-        reset_state = self.env.reset(reset_rng, goal=new_go_goal, start=first_start)
+        reset_state = self.env.reset(reset_rng, goal=new_go_goal, start=reset_start)
 
         def _where_masked(x_reset, x_current):
             if not hasattr(x_reset, 'shape'):
@@ -548,7 +421,8 @@ class GoExploreWrapper(Wrapper):
         info['go_successes_total']      = new_go_successes_total
         info['go_success_steps_total']  = new_go_success_steps_total
         info['first_obs']               = new_first_obs
-        info['first_start']             = first_start   # unchanged, carry forward
+        info['first_start']             = state.info['first_start']  # unchanged, carry forward
         info['proposed_goals']          = proposed_goals
+        info['proposed_starts']         = state.info.get('proposed_starts', state.info['first_start'])
 
         return nstate.replace(pipeline_state=reset_pipeline_state, obs=reset_obs, info=info)

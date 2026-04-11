@@ -1,4 +1,4 @@
-"""Exploration metrics for ``ResetExplore`` fork mode (SMC, etc.).
+"""Exploration metrics for GoExplore fork mode (SMC, etc.).
 
 Factory pattern mirrors ``goal_proposers.create_goal_proposer``: register new
 metrics by extending ``create_exploration_metric`` without changing call sites.

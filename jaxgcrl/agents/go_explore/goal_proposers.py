@@ -16,11 +16,19 @@ def create_goal_proposer(
     goal_indices: Optional[tuple] = None,
     actor: Optional[Any] = None,
     critic: Optional[Any] = None,
-    discounting: float=0.99,
+    discounting: float = 0.99,
+    traj_encoder: Optional[Any] = None,
+    knn_k: int = 12,
+    knn_clip: float = 0.0001,
+    wm_modules: Optional[Any] = None,
+    mppi_horizon: int = 50,
+    mppi_samples: int = 500,
+    mppi_iterations: int = 5,
+    mppi_gamma: float = 10.0,
 ) -> Callable:
     """
     Factory function to create a goal proposer function.
-    
+
     Args:
         goal_proposer_name: Name of the goal proposer to create
         env: The environment instance
@@ -31,7 +39,10 @@ def create_goal_proposer(
         actor: Optional actor network object (for goal proposers that need to sample actions)
         critic: Optional critic network object (for goal proposers that need to compute values)
         discounting: Discount factor for geometric future-state sampling (ucgr only)
-        
+        traj_encoder: Optional TrajEncoder module (for TLDR goal proposer)
+        knn_k: K nearest neighbors for PBE (for TLDR goal proposer)
+        knn_clip: Distance clipping for PBE (for TLDR goal proposer)
+
     Returns:
         A goal proposer function that takes (rng, start_obs, goal_proposer_state) and returns (goal, updated_state).
         The goal proposer state can be read from and written to.
@@ -57,6 +68,11 @@ def create_goal_proposer(
         return create_mega_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices)
     elif goal_proposer_name == "omega":
         return create_omega_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices)
+    elif goal_proposer_name == "tldr":
+        return create_tldr_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, traj_encoder, knn_k, knn_clip)
+    elif goal_proposer_name == "peg":
+        return create_peg_goal_proposer(env, num_envs, state_size, goal_indices, actor, wm_modules,
+                                        mppi_horizon, mppi_samples, mppi_iterations, mppi_gamma)
     else:
         raise ValueError(f"Unknown goal proposer: {goal_proposer_name}")
 
@@ -658,5 +674,100 @@ def create_omega_goal_proposer(
         }
 
         return selected_goal, goal_proposer_state, log_data
+
+    return propose_goal
+
+
+# ── TLDR goal proposer ──────────────────────────────────────────────────────
+
+def create_tldr_goal_proposer(
+    env, num_envs, num_candidates, state_size, goal_indices, traj_encoder, knn_k, knn_clip,
+):
+    """Select goals by PBE novelty in the traj encoder's latent space.
+
+    Samples candidate states from the replay buffer, encodes them via the
+    trajectory encoder, scores each by K-NN self-similarity (PBE), and
+    selects the most novel candidate as the goal.
+
+    Reference: ``tldr/iod/tldr.py`` ``get_random_goals()`` lines 265-300.
+    """
+    from .tldr import pbe_score_candidates
+
+    goal_idx_array = jnp.array(goal_indices)
+
+    def propose_goal(rng, start_obs, goal_proposer_state):
+        transitions_sample = goal_proposer_state.transitions_sample
+        te_params = goal_proposer_state.te_params
+
+        # Flatten buffer observations → (N, obs_size)
+        obs_flat = jnp.reshape(
+            transitions_sample.observation,
+            (-1, transitions_sample.observation.shape[-1]),
+        )
+        n_buf = obs_flat.shape[0]
+
+        # Sample num_candidates random indices from buffer
+        rng, sample_rng = jax.random.split(rng)
+        cand_indices = jax.random.randint(sample_rng, (num_candidates,), 0, n_buf)
+        candidate_obs = obs_flat[cand_indices]  # (num_candidates, obs_size)
+        candidate_states = candidate_obs[:, :state_size]  # raw state only
+
+        # Score candidates by PBE novelty in latent space
+        scores = pbe_score_candidates(
+            te_params, traj_encoder, candidate_states, knn_k, knn_clip,
+        )
+
+        # Select most novel candidate
+        best_idx = jnp.argmax(scores)
+        candidate_goals = candidate_states[:, goal_idx_array]  # (num_candidates, goal_dim)
+        selected_goal = candidate_goals[best_idx]
+
+        first_obs_position = start_obs[:state_size][goal_idx_array]
+        log_data = {
+            "candidate_goals": candidate_goals,
+            "pbe_scores": scores,
+            "first_obs_position": first_obs_position,
+            "selected_goal": selected_goal,
+        }
+        return selected_goal, goal_proposer_state, log_data
+
+    return propose_goal
+
+
+# ── PEG goal proposer (MPPI planning through world model) ───────────────────
+
+def create_peg_goal_proposer(
+    env, num_envs, state_size, goal_indices, gcp_actor, wm_modules,
+    mppi_horizon, mppi_samples, mppi_iterations, mppi_gamma,
+):
+    """Plan goals via MPPI through the world model to maximise disagreement.
+
+    Reference: ``peg/dreamerv2/goal_picker.py`` SubgoalPlanner.
+    """
+    from .peg import mppi_plan_goal
+
+    goal_idx_array = jnp.array(goal_indices)
+    goal_dim = len(goal_indices)
+    goal_min = jnp.array(env.x_bounds[:1] + env.y_bounds[:1], dtype=jnp.float32)
+    goal_max = jnp.array(env.x_bounds[1:] + env.y_bounds[1:], dtype=jnp.float32)
+
+    def propose_goal(rng, start_obs, goal_proposer_state):
+        actor_params = goal_proposer_state.actor_params
+        wm_params_list = goal_proposer_state.wm_ensemble_params
+        current_state = start_obs[:state_size]
+
+        planned_goal = mppi_plan_goal(
+            gcp_actor, actor_params,
+            wm_modules, wm_params_list,
+            current_state, goal_dim, goal_min, goal_max,
+            mppi_samples, mppi_horizon, mppi_iterations, mppi_gamma,
+            rng,
+        )
+
+        log_data = {
+            "first_obs_position": current_state[goal_idx_array],
+            "selected_goal": planned_goal,
+        }
+        return planned_goal, goal_proposer_state, log_data
 
     return propose_goal

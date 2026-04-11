@@ -1,4 +1,4 @@
-"""Forking algorithms for ``ResetExplore`` when ``fork_type`` is set."""
+"""Forking algorithms for GoExplore when ``fork_type`` is set."""
 
 from typing import Any, Callable, Optional, Tuple
 
@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxgcrl.agents.go_explore.types import GoalProposerState
-from jaxgcrl.agents.reset_explore.exploration import create_exploration_metric
+from jaxgcrl.agents.go_explore.exploration import create_exploration_metric
 
 
 def smc_fork(

@@ -14,7 +14,7 @@ def energy_fn(name, x, y):
     elif name == "dot":
         return jnp.sum(x * y, axis=-1)
     elif name == "cosine":
-        return jnp.sum(x * y, axis=-1) / (jnp.linalg.norm(x) * jnp.linalg.norm(y) + 1e-6)
+        return jnp.sum(x * y, axis=-1) / (jnp.linalg.norm(x, axis=-1) * jnp.linalg.norm(y, axis=-1) + 1e-6)
     elif name == "l2":
         return -jnp.sum((x - y) ** 2, axis=-1)
     else:

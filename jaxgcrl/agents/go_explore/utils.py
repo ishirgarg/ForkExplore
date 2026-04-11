@@ -64,22 +64,32 @@ def flatten_batch(buffer_config, transition, sample_key):
     state = transition.observation[:-1, :state_size]  # all states are considered
     new_obs = jnp.concatenate([state, goal], axis=1)
 
+    state_extras = {
+        "truncation": jnp.squeeze(transition.extras["state_extras"]["truncation"][:-1]),
+        "traj_id": jnp.squeeze(transition.extras["state_extras"]["traj_id"][:-1]),
+    }
+    if "phase" in transition.extras["state_extras"]:
+        state_extras["phase"] = jnp.squeeze(transition.extras["state_extras"]["phase"][:-1])
+
     extras = {
         "policy_extras": {},
-        "state_extras": {
-            "truncation": jnp.squeeze(transition.extras["state_extras"]["truncation"][:-1]),
-            "traj_id": jnp.squeeze(transition.extras["state_extras"]["traj_id"][:-1]),
-        },
+        "state_extras": state_extras,
         "state": state,
         "future_state": future_state,
         "future_action": future_action,
     }
+
+    # Trim next_observation to match [:-1] trimming of other fields
+    next_obs = transition.next_observation
+    if next_obs is not None:
+        next_obs = jnp.squeeze(next_obs[:-1])
 
     return transition._replace(
         observation=jnp.squeeze(new_obs),  # this has shape (num_envs, episode_length-1, obs_size)
         action=jnp.squeeze(transition.action[:-1]),
         reward=jnp.squeeze(transition.reward[:-1]),
         discount=jnp.squeeze(transition.discount[:-1]),
+        next_observation=next_obs,
         extras=extras,
     )
 

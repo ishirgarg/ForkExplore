@@ -1,10 +1,11 @@
 """Go Explore agent.
 
 Two-phase training loop:
-  - Go phase   (phase == 0): GCP navigates to a proposed frontier goal.
-  - Explore phase (phase == 1): continuation of go phase with eps-random actions
-    and stochastic policy sampling.
+  - Go phase   (phase == 0): GCP navigates to a proposed frontier goal (stochastic).
+  - Explore phase (phase == 1): optional separate non-goal-conditioned explore policy,
+    or reuse GCP with higher eps-random.  Intrinsic reward: ``std(V(s))``.
 
+Optional features: reset proposer, SMC fork redistribution (explore-phase only).
 Phase management is handled by ``GoExploreWrapper`` (see ``jaxgcrl/envs/wrappers.py``).
 """
 
@@ -48,8 +49,8 @@ from .goal_proposers import (
     create_goal_proposer,
     create_random_env_goals_proposer,
 )
-import numpy as np
-import os
+from .fork_algo import create_fork_fn
+from .explore_losses import compute_explore_reward
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -58,11 +59,13 @@ State = Union[envs.State, envs_v1.State]
 
 @dataclass
 class GoExplore:
-    """Go Explore agent with a single goal-conditioned policy.
+    """Go Explore agent with two-phase training.
 
-    The go phase navigates to a proposed frontier goal. The explore phase
-    continues with the same policy but samples stochastically and injects
-    uniform random actions with probability ``eps_random_action``.
+    Go phase (phase 0): GCP navigates to a proposed frontier goal (stochastic).
+    Explore phase (phase 1): either a separate non-goal-conditioned policy or
+    the same GCP with higher eps-random probability.
+
+    Phase management is handled by ``GoExploreWrapper`` (see ``jaxgcrl/envs/wrappers.py``).
     """
 
     # Algorithm type for the goal-conditioned policy
@@ -97,14 +100,59 @@ class GoExplore:
     n_critics: int = 2
     use_her: bool = True
 
-    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega"] = "random_env_goals"
+    goal_proposer_name: Literal[
+        "random_env_goals", "rb", "q_epistemic", "ucgr",
+        "max_critic_to_env", "mega", "omega", "tldr", "peg",
+    ] = "random_env_goals"
     num_candidates: int = 512
 
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
-    num_ep_steps: int = 250        # steps in explore phase before reset to go
-    deterministic_go_phase: bool = False  # if True, go phase uses policy mode
-    eps_random_action: float = 0.1        # probability of uniform random action in explore phase
+    num_ep_steps: int = 250       # steps in explore phase before reset
+    eps_random_action: float = 0.1  # probability of uniform random action in explore phase
+
+    # ── Explore policy (None = reuse Go policy) ─────────────────────────────
+    explore_policy_type: Optional[Literal["sac"]] = None  # "sac" supported; extend as needed
+    explore_n_critics: int = 2
+    explore_policy_lr: float = 3e-4
+    explore_critic_lr: float = 3e-4
+    explore_alpha_lr: float = 3e-4
+    explore_eps_random_action: float = 0.2  # eps_random when explore_policy_type is None
+
+    # ── Explore reward type ────────────────────────────────────────────────
+    explore_reward_type: Literal["q_uncertainty", "tldr", "peg"] = "q_uncertainty"
+
+    # ── TLDR hyperparameters (used when explore_reward_type="tldr") ────────
+    te_hidden_dim: int = 1024       # traj encoder hidden layer width
+    te_hidden_layers: int = 2       # traj encoder hidden layer count
+    te_output_dim: int = 4          # traj encoder latent dimension
+    te_lr: float = 1e-4             # traj encoder learning rate
+    dual_lam_init: float = 30.0     # initial dual Lagrange multiplier
+    dual_slack: float = 1e-3        # constraint slack
+    dual_lr: float = 1e-4           # dual lambda learning rate
+    knn_k: int = 12                 # K nearest neighbors for PBE
+    knn_clip: float = 0.0001        # distance clipping for PBE
+
+    # ── PEG hyperparameters (used when explore_reward_type="peg" or goal_proposer_name="peg")
+    wm_ensemble_size: int = 5       # world model ensemble members
+    wm_hidden_dim: int = 400        # world model MLP hidden width
+    wm_hidden_layers: int = 3       # world model MLP hidden depth
+    wm_lr: float = 3e-4             # world model learning rate
+    mppi_horizon: int = 50          # MPPI planning horizon
+    mppi_samples: int = 500         # MPPI samples per iteration
+    mppi_iterations: int = 5        # MPPI optimization steps
+    mppi_gamma: float = 10.0        # MPPI temperature
+
+    # ── Reset proposer (None = initial state distribution) ──────────────────
+    reset_proposer_name: Optional[Literal[
+        "random_env_goals", "rb", "q_epistemic", "ucgr",
+        "max_critic_to_env", "mega", "omega", "tldr", "peg",
+    ]] = None
+
+    # ── Fork redistribution (None = disabled) ───────────────────────────────
+    fork_type: Optional[str] = None  # "smc"
+    fork_sampling_temperature: float = 1.0
+    exploration_metric_name: str = "q_epistemic"
 
     def check_config(self, config):
         assert config.episode_length - 1 == self.num_gcp_steps + self.num_ep_steps, (
@@ -113,6 +161,10 @@ class GoExplore:
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
             "num_envs * (episode_length - 1) must be divisible by batch_size"
         )
+        if self.fork_type is not None:
+            assert config.episode_length % self.unroll_length == 0, (
+                "episode_length must be divisible by unroll_length when fork is enabled"
+            )
 
     def train_fn(
         self,
@@ -212,6 +264,103 @@ class GoExplore:
         if self.agent_type == "sac":
             target_critic_params = gcp_critic_params
 
+        # ── Explore policy (optional separate non-goal-conditioned policy) ────
+        has_explore_policy = self.explore_policy_type is not None
+        explore_actor = None
+        explore_critic = None
+        explore_actor_state = None
+        explore_critic_states = None
+        explore_alpha_state = None
+        explore_target_critic_params = None
+
+        if has_explore_policy:
+            key, explore_actor_key, explore_critic_key = jax.random.split(key, 3)
+            explore_actor, explore_critic = get_algorithm(
+                self.explore_policy_type,
+                action_size=action_size,
+                obs_size=state_size,  # non-goal-conditioned: raw state only
+                h_dim=self.h_dim,
+                n_hidden=self.n_hidden,
+                use_relu=self.use_relu,
+                use_ln=self.use_ln,
+                n_critics=self.explore_n_critics,
+            )
+            explore_actor_params = explore_actor.init(explore_actor_key, np.ones([1, state_size]))
+            explore_critic_params = explore_critic.init(explore_critic_key, np.ones([1, state_size]))
+            explore_actor_state = TrainState.create(
+                apply_fn=explore_actor.apply,
+                params=explore_actor_params,
+                tx=optax.adam(learning_rate=self.explore_policy_lr),
+            )
+            explore_critic_states = explore_critic.create_critic_states(
+                explore_critic_params, self.explore_critic_lr
+            )
+            explore_log_alpha = jnp.asarray(0.0, dtype=jnp.float32)
+            explore_alpha_state = TrainState.create(
+                apply_fn=None,
+                params={"log_alpha": explore_log_alpha},
+                tx=optax.adam(learning_rate=self.explore_alpha_lr),
+            )
+            explore_target_critic_params = explore_critic_params
+
+        # ── TLDR traj encoder (when explore_reward_type == "tldr") ────────────
+        te_state = None
+        dual_lam_state = None
+        pbe_rms_state = None
+        traj_encoder_module = None
+
+        if self.explore_reward_type == "tldr":
+            from .tldr import TrajEncoder
+            traj_encoder_module = TrajEncoder(
+                hidden_dim=self.te_hidden_dim,
+                hidden_layers=self.te_hidden_layers,
+                output_dim=self.te_output_dim,
+            )
+            key, te_key = jax.random.split(key)
+            te_params = traj_encoder_module.init(te_key, jnp.ones([1, state_size]))
+            te_state = TrainState.create(
+                apply_fn=traj_encoder_module.apply,
+                params=te_params,
+                tx=optax.adam(learning_rate=self.te_lr),
+            )
+            log_lam = jnp.log(jnp.asarray(self.dual_lam_init, dtype=jnp.float32))
+            dual_lam_state = TrainState.create(
+                apply_fn=None,
+                params={"log_lam": log_lam},
+                tx=optax.adam(learning_rate=self.dual_lr),
+            )
+            pbe_rms_state = {
+                "M": jnp.zeros((1,)),
+                "S": jnp.ones((1,)),
+                "n": jnp.asarray(1e-4),
+            }
+
+        # ── PEG world model ensemble ─────────────────────────────────────────
+        wm_ensemble_states = None
+        wm_modules = None
+        use_peg = self.explore_reward_type == "peg" or self.goal_proposer_name == "peg"
+
+        if use_peg:
+            from .peg import WorldModelMLP
+            wm_modules = [
+                WorldModelMLP(
+                    state_size=state_size,
+                    hidden_dim=self.wm_hidden_dim,
+                    hidden_layers=self.wm_hidden_layers,
+                )
+                for _ in range(self.wm_ensemble_size)
+            ]
+            wm_ensemble_states_list = []
+            for i in range(self.wm_ensemble_size):
+                key, wm_key = jax.random.split(key)
+                wm_params = wm_modules[i].init(wm_key, jnp.ones([1, state_size + action_size]))
+                wm_ensemble_states_list.append(TrainState.create(
+                    apply_fn=wm_modules[i].apply,
+                    params=wm_params,
+                    tx=optax.adam(learning_rate=self.wm_lr),
+                ))
+            wm_ensemble_states = tuple(wm_ensemble_states_list)
+
         # ── TrainingState ─────────────────────────────────────────────────────
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
@@ -221,6 +370,14 @@ class GoExplore:
             critic_states=gcp_critic_states,
             alpha_state=alpha_state,
             target_critic_params=target_critic_params,
+            explore_actor_state=explore_actor_state,
+            explore_critic_states=explore_critic_states,
+            explore_alpha_state=explore_alpha_state,
+            explore_target_critic_params=explore_target_critic_params,
+            te_state=te_state,
+            dual_lam_state=dual_lam_state,
+            pbe_rms_state=pbe_rms_state,
+            wm_ensemble_states=wm_ensemble_states,
         )
 
         # ── Goal proposer ────────────────────────────────────────────────────
@@ -234,7 +391,59 @@ class GoExplore:
             actor=gcp_actor,
             critic=gcp_critic,
             discounting=self.discounting,
+            traj_encoder=traj_encoder_module,
+            knn_k=self.knn_k,
+            knn_clip=self.knn_clip,
+            wm_modules=wm_modules,
+            mppi_horizon=self.mppi_horizon,
+            mppi_samples=self.mppi_samples,
+            mppi_iterations=self.mppi_iterations,
+            mppi_gamma=self.mppi_gamma,
         )
+
+        # ── Reset proposer (optional) ────────────────────────────────────────
+        reset_proposer = None
+        if self.reset_proposer_name is not None:
+            reset_proposer = create_goal_proposer(
+                self.reset_proposer_name,
+                unwrapped_env,
+                config.num_envs,
+                self.num_candidates,
+                state_size=unwrapped_env.state_dim,
+                goal_indices=unwrapped_env.goal_indices,
+                actor=gcp_actor,
+                critic=gcp_critic,
+                discounting=self.discounting,
+                traj_encoder=traj_encoder_module,
+                knn_k=self.knn_k,
+                knn_clip=self.knn_clip,
+                wm_modules=wm_modules,
+                mppi_horizon=self.mppi_horizon,
+                mppi_samples=self.mppi_samples,
+                mppi_iterations=self.mppi_iterations,
+                mppi_gamma=self.mppi_gamma,
+            )
+
+        # ── Fork redistribution (optional) ───────────────────────────────────
+        use_fork = self.fork_type is not None
+        fork_metric_fn = None
+        goal_idx_arr = jnp.array(unwrapped_env.goal_indices)
+        if use_fork:
+            # We only use fork_metric_fn; the resampling is done inline
+            # with phase masking (go-phase states get -inf scores).
+            _, fork_metric_fn = create_fork_fn(
+                fork_type=self.fork_type,
+                env=unwrapped_env,
+                num_envs=config.num_envs,
+                num_candidates=self.num_candidates,
+                state_size=state_size,
+                goal_indices=tuple(unwrapped_env.goal_indices),
+                actor=gcp_actor,
+                critic=gcp_critic,
+                exploration_metric_name=self.exploration_metric_name,
+                fork_sampling_temperature=self.fork_sampling_temperature,
+                discounting=self.discounting,
+            )
 
         # ── Env reset ────────────────────────────────────────────────────────
         random_goals_proposer = create_random_env_goals_proposer(unwrapped_env, config.num_envs)
@@ -252,10 +461,14 @@ class GoExplore:
         )
 
         # ── Replay buffer ────────────────────────────────────────────────────
+        # Force SAC-style next_observation storage if explore policy needs it
+        needs_next_obs = (self.agent_type == "sac") or has_explore_policy
+        buffer_agent_type = "sac" if needs_next_obs else self.agent_type
+
         dummy_transition = create_single_dummy_transition(
             obs_size=obs_size,
             action_size=action_size,
-            agent_type=self.agent_type,
+            agent_type=buffer_agent_type,
             include_phase=True,
         )
 
@@ -280,7 +493,7 @@ class GoExplore:
             num_envs=config.num_envs,
             obs_size=obs_size,
             action_size=action_size,
-            agent_type=self.agent_type,
+            agent_type=buffer_agent_type,
             include_phase=True,
         )
         buffer_state = replay_buffer.insert(buffer_state, dummy_batch_transition)
@@ -290,62 +503,64 @@ class GoExplore:
             episode_length=config.episode_length,
             obs_size=obs_size,
             action_size=action_size,
-            agent_type=self.agent_type,
+            agent_type=buffer_agent_type,
             include_phase=True,
         )
         goal_proposer_state = GoalProposerState(
             transitions_sample=dummy_goal_proposer_transition,
             actor_params=gcp_actor_state.params,
             critic_params={i: cs.params for i, cs in enumerate(gcp_critic_states)},
+            te_params=te_state.params if te_state is not None else None,
+            wm_ensemble_params=tuple(s.params for s in wm_ensemble_states) if wm_ensemble_states is not None else None,
         )
 
         # ── actor_step ────────────────────────────────────────────────────────
-        deterministic_go = self.deterministic_go_phase
-        eps_random = self.eps_random_action
+        explore_eps = self.explore_eps_random_action
 
         def actor_step(training_state, env, env_state, key, extra_fields):
-            """One env step using a single GCP policy for both phases."""
-            key, action_key, random_key, eps_key, env_rng = jax.random.split(key, 5)
+            """One env step dispatching between Go policy and Explore policy."""
+            key, gcp_key, explore_key, random_key, eps_key, env_rng = jax.random.split(key, 6)
 
             phase     = env_state.info['phase']           # (num_envs,)
             go_goal   = env_state.info['go_goal']         # (num_envs, goal_size)
             raw_state = env_state.obs[:, :state_size]     # (num_envs, state_size)
+            in_explore = (phase == 1)                     # (num_envs,)
 
-            # GCP always sees [state, go_goal] in both phases
+            # GCP obs: [state, go_goal] — used in both phases when no explore policy
             gcp_obs = jnp.concatenate([raw_state, go_goal], axis=-1)
 
-            # Go phase: deterministic if flag set, else stochastic
-            # Explore phase: always stochastic (sample from policy)
-            in_go = (phase == 0)  # (num_envs,)
-            is_deterministic = jnp.where(in_go, deterministic_go, False)
+            # Go phase: always stochastic, no eps_random
+            gcp_actions = gcp_actor.sample_actions(
+                training_state.actor_state.params, gcp_obs, gcp_key, is_deterministic=False
+            )
 
-            # Sample policy actions (per-env deterministic flag handled inside)
-            # We compute both deterministic and stochastic, then select per-env
-            det_actions = gcp_actor.sample_actions(
-                training_state.actor_state.params, gcp_obs, action_key, is_deterministic=True
-            )
-            stoch_actions = gcp_actor.sample_actions(
-                training_state.actor_state.params, gcp_obs, action_key, is_deterministic=False
-            )
-            policy_actions = jnp.where(is_deterministic[:, None], det_actions, stoch_actions)
-
-            # Explore phase: with probability eps_random_action, use uniform random action
-            in_explore = (phase == 1)  # (num_envs,)
-            random_actions = jax.random.uniform(
-                random_key, shape=policy_actions.shape, minval=-1.0, maxval=1.0
-            )
-            use_random = jax.random.uniform(eps_key, shape=(policy_actions.shape[0],)) < eps_random
-            use_random = jnp.logical_and(in_explore, use_random)
-            actions = jnp.where(use_random[:, None], random_actions, policy_actions)
+            if has_explore_policy:
+                # Explore phase: separate non-goal-conditioned SAC policy, no eps_random
+                explore_actions = explore_actor.sample_actions(
+                    training_state.explore_actor_state.params,
+                    raw_state,  # state only, no goal
+                    explore_key,
+                    is_deterministic=False,
+                )
+                # Select per-env: go policy for go phase, explore policy for explore phase
+                actions = jnp.where(in_explore[:, None], explore_actions, gcp_actions)
+            else:
+                # Default: GCP in both phases, explore phase gets eps_random=0.2
+                random_actions = jax.random.uniform(
+                    random_key, shape=gcp_actions.shape, minval=-1.0, maxval=1.0
+                )
+                use_random = jax.random.uniform(eps_key, shape=(gcp_actions.shape[0],)) < explore_eps
+                use_random = jnp.logical_and(in_explore, use_random)
+                actions = jnp.where(use_random[:, None], random_actions, gcp_actions)
 
             nstate = env.step(env_state, actions, env_rng)
             state_extras = {x: nstate.info[x] for x in extra_fields}
             state_extras['phase'] = phase
 
-            # Build next_observation for SAC if needed
+            # Always store [state, goal] as observation and next_observation
             next_obs = jnp.concatenate(
                 [nstate.obs[:, :state_size], go_goal], axis=-1
-            ) if self.agent_type == "sac" else None
+            ) if needs_next_obs else None
 
             return nstate, Transition(
                 observation=gcp_obs,
@@ -356,38 +571,51 @@ class GoExplore:
                 extras={"state_extras": state_extras},
             )
 
-        # ── get_experience ────────────────────────────────────────────────────
+        # ── get_experience (with macro_step, reset proposer, fork) ────────────
+        num_envs_     = config.num_envs
+        episode_length_ = config.episode_length
+
         def get_experience(training_state, env_state, buffer_state, key,
-                           experience_count, goal_proposer_state):
+                           goal_proposer_state, macro_step):
             buffer_state, transitions_sample = replay_buffer.sample(buffer_state)
 
             goal_proposer_state = goal_proposer_state.replace(
                 transitions_sample=transitions_sample,
                 actor_params=training_state.actor_state.params,
                 critic_params={i: cs.params for i, cs in enumerate(training_state.critic_states)},
+                te_params=training_state.te_state.params if training_state.te_state is not None else None,
+                wm_ensemble_params=tuple(s.params for s in training_state.wm_ensemble_states) if training_state.wm_ensemble_states is not None else None,
             )
 
-            num_envs_     = config.num_envs
-            episode_length = config.episode_length
-            info           = dict(env_state.info)
+            key, k_propose, k_roll, k_fork = jax.random.split(key, 4)
 
-            reset_threshold    = jnp.array(episode_length // (self.unroll_length * 2), dtype=jnp.int32)
-            new_experience_count = experience_count + 1
-
-            def propose_new_goals(env_state, key, info, experience_count, goal_proposer_state):
-                viz_key, goal_key = jax.random.split(key)
+            # ── Episode start: propose goals (and optionally starts) ─────────
+            def propose_goals_and_starts(es, prop_key, gps):
+                info = dict(es.info)
+                first_obs = info['first_obs']
+                viz_key, goal_key, reset_key = jax.random.split(prop_key, 3)
                 viz_env_idx = jax.random.randint(viz_key, (), 0, num_envs_)
-                goal_keys   = jax.random.split(goal_key, num_envs_)
-                first_obs   = info['first_obs']
+                goal_keys = jax.random.split(goal_key, num_envs_)
 
                 def propose_single(rng_key, obs, state):
-                    goal, updated_state, log_data = goal_proposer(rng_key, obs, state)
+                    goal, _, log_data = goal_proposer(rng_key, obs, state)
                     return goal, log_data
 
                 new_goals, log_data_tree = jax.vmap(
                     propose_single, in_axes=(0, 0, None)
-                )(goal_keys, first_obs, goal_proposer_state)
+                )(goal_keys, first_obs, gps)
                 info['proposed_goals'] = new_goals
+
+                # Reset proposer: propose start states if configured
+                if reset_proposer is not None:
+                    reset_keys = jax.random.split(reset_key, num_envs_)
+                    def propose_start(rng_key, obs, state):
+                        start, _, _ = reset_proposer(rng_key, obs, state)
+                        return start
+                    new_starts = jax.vmap(
+                        propose_start, in_axes=(0, 0, None)
+                    )(reset_keys, first_obs, gps)
+                    info['proposed_starts'] = new_starts
 
                 env_steps = training_state.env_steps
 
@@ -401,24 +629,19 @@ class GoExplore:
 
                 jax.experimental.io_callback(
                     log_viz, jnp.array(0, dtype=jnp.int32),
-                    log_data_tree, viz_env_idx, env_steps
+                    log_data_tree, viz_env_idx, env_steps,
                 )
-                return env_state, info, jnp.array(0, dtype=jnp.int32), goal_proposer_state
+                return es.replace(info=info)
 
-            def keep_existing_goals(env_state, key, info, experience_count, goal_proposer_state):
-                return env_state, info, experience_count + 1, goal_proposer_state
-
-            env_state, info, updated_experience_count, updated_goal_proposer_state = jax.lax.cond(
-                new_experience_count >= reset_threshold,
-                propose_new_goals,
-                keep_existing_goals,
-                env_state, key, info, experience_count, goal_proposer_state,
+            env_state = jax.lax.cond(
+                macro_step == 0,
+                lambda: propose_goals_and_starts(env_state, k_propose, goal_proposer_state),
+                lambda: env_state,
             )
-            env_state = env_state.replace(info=info)
 
-            @jax.jit
-            def f(carry, _):
-                env_state, buffer_state, k = carry
+            # ── Rollout for unroll_length steps ──────────────────────────────
+            def rollout_fn(carry, _):
+                env_state, k = carry
                 k, next_k = jax.random.split(k)
                 env_state, transition = actor_step(
                     training_state,
@@ -427,36 +650,108 @@ class GoExplore:
                     k,
                     extra_fields=("truncation", "traj_id", "phase"),
                 )
-                return (env_state, buffer_state, next_k), transition
+                return (env_state, next_k), transition
 
-            (env_state, buffer_state, _), data = jax.lax.scan(
-                f, (env_state, buffer_state, key), (), length=self.unroll_length
+            (env_state, _), data = jax.lax.scan(
+                rollout_fn, (env_state, k_roll), (), length=self.unroll_length
             )
             buffer_state = replay_buffer.insert(buffer_state, data)
 
-            return env_state, buffer_state, updated_experience_count, updated_goal_proposer_state
+            # ── Macro step update ────────────────────────────────────────────
+            macro_new = macro_step + self.unroll_length
+
+            # ── Fork redistribution (between unroll chunks, not at episode end)
+            if use_fork:
+                def fork_redistribute(es, fkey, gps):
+                    fk, rk = jax.random.split(fkey)
+                    info = dict(es.info)
+                    phase = info['phase']
+                    in_explore = (phase == 1)
+
+                    states_full = es.obs[:, :state_size]
+                    goals = info['go_goal']
+
+                    # Score all states, set go-phase scores to -inf so they get
+                    # zero weight in the softmax resampling
+                    all_scores = fork_metric_fn(fk, states_full, goals, gps)
+                    masked_scores = jnp.where(in_explore, all_scores, -jnp.inf)
+
+                    # Run SMC on all states but with masked scores
+                    n = states_full.shape[0]
+                    logits = masked_scores / jnp.asarray(self.fork_sampling_temperature, dtype=masked_scores.dtype)
+                    logits = logits - jnp.max(logits)
+                    weights = jnp.exp(logits)
+                    weights = weights / (jnp.sum(weights) + 1e-10)
+                    log_w = jnp.log(weights + 1e-10)
+                    rk_split = jax.random.split(rk, n)
+                    indices = jax.vmap(lambda k: jax.random.categorical(k, log_w))(rk_split)
+                    forked_states = states_full[indices]
+
+                    # Only apply fork to explore-phase envs
+                    selected = jnp.where(in_explore[:, None], forked_states, states_full)
+                    new_starts = selected[:, goal_idx_arr]
+
+                    # Reset physics for all (JAX traces both), mask to explore only
+                    rk2 = jax.random.split(jax.random.fold_in(rk, 1), num_envs_)
+                    reset_state = train_env.env.reset(rk2, goal=goals, start=new_starts)
+
+                    def _where_explore(x_reset, x_current):
+                        if not hasattr(x_reset, 'shape'):
+                            return x_current
+                        if x_reset.ndim == 0:
+                            return x_current
+                        if x_reset.shape[0] != in_explore.shape[0]:
+                            return x_current
+                        mask = jnp.reshape(in_explore, [in_explore.shape[0]] + [1] * (x_reset.ndim - 1))
+                        return jnp.where(mask, x_reset, x_current)
+
+                    new_pipeline = jax.tree.map(
+                        _where_explore, reset_state.pipeline_state, es.pipeline_state
+                    )
+                    new_obs = jnp.where(in_explore[:, None], reset_state.obs, es.obs)
+
+                    # Increment traj_id for forked explore envs only
+                    info['traj_id'] = info['traj_id'] + jnp.where(in_explore, 1.0, 0.0)
+
+                    return es.replace(pipeline_state=new_pipeline, obs=new_obs, info=info)
+
+                env_state = jax.lax.cond(
+                    macro_new < episode_length_,
+                    lambda: fork_redistribute(env_state, k_fork, goal_proposer_state),
+                    lambda: env_state,
+                )
+
+            # Reset macro_step at episode boundary
+            macro_out = jax.lax.cond(
+                macro_new >= episode_length_,
+                lambda: jnp.int32(0),
+                lambda: macro_new,
+            )
+
+            return env_state, buffer_state, goal_proposer_state, macro_out
 
         # ── prefill_replay_buffer ─────────────────────────────────────────────
-        def prefill_replay_buffer(training_state, env_state, buffer_state, key, goal_proposer_state):
-            @jax.jit
+        def prefill_replay_buffer(training_state, env_state, buffer_state, key,
+                                  goal_proposer_state, macro_step):
             def f(carry, _):
-                ts, es, bs, k, gps = carry
+                ts, es, bs, k, gps, ms = carry
                 k, new_k = jax.random.split(k)
-                es, bs, ec, gps = get_experience(ts, es, bs, k, ts.experience_count, gps)
+                es, bs, gps, ms = get_experience(ts, es, bs, k, gps, ms)
                 ts = ts.replace(
                     env_steps=ts.env_steps + config.num_envs * self.unroll_length,
-                    experience_count=ec,
                 )
-                return (ts, es, bs, new_k, gps), ()
+                return (ts, es, bs, new_k, gps, ms), ()
 
             return jax.lax.scan(
                 f,
-                (training_state, env_state, buffer_state, key, goal_proposer_state),
+                (training_state, env_state, buffer_state, key, goal_proposer_state, macro_step),
                 (),
                 length=num_prefill_actor_steps,
             )[0]
 
-        # ── update_networks (GCP only) ────────────────────────────────────────
+        # ── update_networks ───────────────────────────────────────────────────
+        explore_target_entropy = -0.5 * action_size
+
         @jax.jit
         def update_networks(carry, transitions):
             training_state, key = carry
@@ -474,9 +769,11 @@ class GoExplore:
                 obs_size=obs_size,
                 goal_indices=train_env.goal_indices,
                 target_entropy=target_entropy,
+                explore_target_entropy=explore_target_entropy,
             )
             networks = dict(actor=gcp_actor, critic=gcp_critic)
 
+            # ── GCP update on ALL transitions ────────────────────────────────
             metrics = {}
             if self.agent_type == "crl":
                 training_state, actor_metrics  = gcp_actor.update(context, networks, transitions, training_state, actor_key)
@@ -489,7 +786,7 @@ class GoExplore:
             metrics.update(critic_metrics)
             metrics.update(actor_metrics)
 
-            # Update SAC target network
+            # Update GCP SAC target network
             if self.agent_type == "sac" and training_state.target_critic_params is not None:
                 full_cp = {}
                 for i, cs in enumerate(training_state.critic_states):
@@ -501,21 +798,135 @@ class GoExplore:
                 )
                 training_state = training_state.replace(target_critic_params=new_target)
 
+            # ── PEG world model training (on ALL transitions) ─────────────────
+            if use_peg:
+                from .peg import train_world_model_ensemble as train_wm
+                wm_obs = transitions.observation[:, :state_size]
+                wm_next_obs = transitions.next_observation[:, :state_size]
+                wm_actions = transitions.action
+                new_wm_states, wm_metrics = train_wm(
+                    training_state.wm_ensemble_states, wm_modules,
+                    wm_obs, wm_actions, wm_next_obs,
+                )
+                training_state = training_state.replace(wm_ensemble_states=new_wm_states)
+                for k, v in wm_metrics.items():
+                    metrics[k] = v
+
+            # ── Explore policy update (reuses standard SAC losses) ────────────
+            if has_explore_policy:
+                key, explore_alpha_key, explore_critic_key, explore_actor_key, reward_key = jax.random.split(key, 5)
+
+                # Phase mask → sample_weights so standard losses weight by phase
+                phase = transitions.extras["state_extras"]["phase"]
+                phase_mask = (phase == 1).astype(jnp.float32)
+
+                # Compute intrinsic reward based on explore_reward_type
+                explore_obs = transitions.observation[:, :state_size]
+                explore_next_obs = transitions.next_observation[:, :state_size]
+
+                if self.explore_reward_type == "tldr":
+                    from .tldr import compute_pbe_intrinsic_reward, update_traj_encoder
+
+                    # Train traj encoder + dual lambda on this batch
+                    new_te_state, new_dual_lam_state, te_metrics = update_traj_encoder(
+                        training_state.te_state, training_state.dual_lam_state,
+                        traj_encoder_module, explore_obs, explore_next_obs, self.dual_slack,
+                    )
+                    training_state = training_state.replace(
+                        te_state=new_te_state, dual_lam_state=new_dual_lam_state,
+                    )
+
+                    # Compute PBE intrinsic reward
+                    explore_reward, new_rms = compute_pbe_intrinsic_reward(
+                        new_te_state.params, traj_encoder_module,
+                        explore_obs, explore_next_obs,
+                        self.knn_k, self.knn_clip, training_state.pbe_rms_state,
+                    )
+                    explore_reward = jax.lax.stop_gradient(explore_reward)
+                    training_state = training_state.replace(pbe_rms_state=new_rms)
+                    for k, v in te_metrics.items():
+                        metrics[f"explore_{k}"] = v
+                elif self.explore_reward_type == "peg":
+                    from .peg import compute_peg_explore_reward
+                    explore_reward = jax.lax.stop_gradient(
+                        compute_peg_explore_reward(
+                            training_state.wm_ensemble_states, wm_modules,
+                            explore_obs, transitions.action,
+                        )
+                    )
+                else:  # q_uncertainty (default)
+                    explore_reward = jax.lax.stop_gradient(
+                        compute_explore_reward(
+                            explore_actor, explore_critic,
+                            training_state.explore_actor_state.params,
+                            training_state.explore_critic_states,
+                            explore_obs, reward_key,
+                        )
+                    )
+                explore_transitions = transitions._replace(
+                    observation=explore_obs,
+                    next_observation=explore_next_obs,
+                    reward=explore_reward,
+                )
+
+                # Swap explore fields into standard positions so standard losses work
+                explore_ts = training_state.replace(
+                    actor_state=training_state.explore_actor_state,
+                    critic_states=training_state.explore_critic_states,
+                    alpha_state=training_state.explore_alpha_state,
+                    target_critic_params=training_state.explore_target_critic_params,
+                )
+                explore_context = {**context, "sample_weights": phase_mask, "target_entropy": explore_target_entropy}
+                explore_nets = dict(actor=explore_actor, critic=explore_critic)
+
+                # Standard SAC update (alpha → critic → actor)
+                explore_ts, explore_alpha_m = update_alpha_sac(
+                    explore_context, explore_nets, explore_transitions, explore_ts, explore_alpha_key,
+                )
+                explore_ts, explore_critic_m = explore_critic.update(
+                    explore_context, explore_nets, explore_transitions, explore_ts, explore_critic_key,
+                )
+                explore_ts, explore_actor_m = explore_actor.update(
+                    explore_context, explore_nets, explore_transitions, explore_ts, explore_actor_key,
+                )
+
+                # Target network EMA for explore critic
+                full_cp = {}
+                for i, cs in enumerate(explore_ts.critic_states):
+                    for lname, lparams in cs.params.items():
+                        full_cp[f"critic_{i}_{lname}"] = lparams
+                new_explore_target = jax.tree_util.tree_map(
+                    lambda x, y: x * (1 - self.tau) + y * self.tau,
+                    explore_ts.target_critic_params, full_cp,
+                )
+
+                # Swap results back into explore fields
+                training_state = training_state.replace(
+                    explore_actor_state=explore_ts.actor_state,
+                    explore_critic_states=explore_ts.critic_states,
+                    explore_alpha_state=explore_ts.alpha_state,
+                    explore_target_critic_params=new_explore_target,
+                )
+
+                # Prefix metrics with "explore_"
+                for k, v in {**explore_alpha_m, **explore_critic_m, **explore_actor_m}.items():
+                    metrics[f"explore_{k}"] = v
+
             training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
             return (training_state, key), metrics
 
         # ── training_step ─────────────────────────────────────────────────────
         @jax.jit
-        def training_step(training_state, env_state, buffer_state, key, goal_proposer_state):
+        def training_step(training_state, env_state, buffer_state, key,
+                          goal_proposer_state, macro_step):
             exp_key, process_key, train_key = jax.random.split(key, 3)
 
-            env_state, buffer_state, updated_ec, updated_gps = get_experience(
+            env_state, buffer_state, updated_gps, macro_next = get_experience(
                 training_state, env_state, buffer_state, exp_key,
-                training_state.experience_count, goal_proposer_state,
+                goal_proposer_state, macro_step,
             )
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
-                experience_count=updated_ec,
             )
 
             # GCP update on all transitions
@@ -529,27 +940,27 @@ class GoExplore:
                 update_networks, (training_state, train_key), transitions
             )
 
-            return (training_state, env_state, buffer_state, updated_gps), metrics
+            return (training_state, env_state, buffer_state, updated_gps, macro_next), metrics
 
         # ── training_epoch ────────────────────────────────────────────────────
         @jax.jit
-        def training_epoch(training_state, env_state, buffer_state, key, goal_proposer_state):
+        def training_epoch(training_state, env_state, buffer_state, key,
+                           goal_proposer_state, macro_step):
             # Snapshot cumulative counters *before* the epoch so we can compute
             # epoch-level deltas (rather than a lifetime average).
             pre_completions   = jnp.sum(env_state.info['go_completions_total'])
             pre_successes     = jnp.sum(env_state.info['go_successes_total'])
             pre_success_steps = jnp.sum(env_state.info['go_success_steps_total'])
 
-            @jax.jit
             def f(carry, _):
-                ts, es, bs, k, gps = carry
+                ts, es, bs, k, gps, ms = carry
                 k, train_key = jax.random.split(k)
-                (ts, es, bs, gps), metrics = training_step(ts, es, bs, train_key, gps)
-                return (ts, es, bs, k, gps), metrics
+                (ts, es, bs, gps, ms), metrics = training_step(ts, es, bs, train_key, gps, ms)
+                return (ts, es, bs, k, gps, ms), metrics
 
-            (training_state, env_state, buffer_state, key, goal_proposer_state), metrics = jax.lax.scan(
+            (training_state, env_state, buffer_state, key, goal_proposer_state, macro_step), metrics = jax.lax.scan(
                 f,
-                (training_state, env_state, buffer_state, key, goal_proposer_state),
+                (training_state, env_state, buffer_state, key, goal_proposer_state, macro_step),
                 (),
                 length=num_training_steps_per_epoch,
             )
@@ -571,12 +982,13 @@ class GoExplore:
             metrics["avg_go_phase_steps"]    = jnp.broadcast_to(avg_go_steps, scan_shape)
             metrics["buffer_current_size"]   = jnp.broadcast_to(replay_buffer.size(buffer_state), scan_shape)
 
-            return training_state, env_state, buffer_state, goal_proposer_state, metrics
+            return training_state, env_state, buffer_state, goal_proposer_state, macro_step, metrics
 
         # ── prefill ───────────────────────────────────────────────────────────
+        macro_init = jnp.int32(0)
         key, prefill_key = jax.random.split(key)
-        training_state, env_state, buffer_state, _, goal_proposer_state = prefill_replay_buffer(
-            training_state, env_state, buffer_state, prefill_key, goal_proposer_state
+        training_state, env_state, buffer_state, _, goal_proposer_state, macro_step = prefill_replay_buffer(
+            training_state, env_state, buffer_state, prefill_key, goal_proposer_state, macro_init
         )
 
         # ── Evaluator ─────────────────────────────────────────────────────────
@@ -615,8 +1027,8 @@ class GoExplore:
             t = time.time()
             key, epoch_key = jax.random.split(key)
 
-            training_state, env_state, buffer_state, goal_proposer_state, metrics = training_epoch(
-                training_state, env_state, buffer_state, epoch_key, goal_proposer_state
+            training_state, env_state, buffer_state, goal_proposer_state, macro_step, metrics = training_epoch(
+                training_state, env_state, buffer_state, epoch_key, goal_proposer_state, macro_step
             )
 
             metrics = jax.tree_util.tree_map(jnp.mean, metrics)
