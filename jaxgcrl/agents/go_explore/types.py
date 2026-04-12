@@ -128,3 +128,4 @@ class GoalProposerState:
     obs_decoder_params: Optional[Any] = None  # Decoder params (for latent-space PEG goal proposer)
     rssm_params: Optional[Any] = None   # RSSM world model params (for peg_rssm goal proposer)
     disag_params: Optional[Any] = None  # Disagreement ensemble params (for peg_rssm goal proposer)
+    normalizer_params: Optional[Any] = None  # Running obs normalizer (for MPPI actor calls)

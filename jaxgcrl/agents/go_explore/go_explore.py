@@ -15,11 +15,13 @@ import time
 from typing import Callable, Literal, Optional, Tuple, Union
 
 import jax
+jax.config.update("jax_debug_nans", True)
 import jax.numpy as jnp
 import numpy as np
 import optax
 from brax import base, envs
 from brax.training import types
+from brax.training.acme import running_statistics, specs as brax_specs
 from brax.v1 import envs as envs_v1
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
@@ -92,6 +94,7 @@ class GoExplore:
 
     repr_dim: int = 64
     use_ln: bool = True
+    normalize_obs: bool = True  # normalise raw state observations with online running stats
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
@@ -485,6 +488,13 @@ class GoExplore:
                 lr=self.rssm_lr, eps=self.rssm_eps, clip=self.rssm_clip, wd=self.rssm_wd,
             )
 
+        # ── Observation normalizer ────────────────────────────────────────────
+        normalizer_params = None
+        if self.normalize_obs:
+            normalizer_params = running_statistics.init_state(
+                brax_specs.Array((state_size,), jnp.dtype("float32"))
+            )
+
         # ── TrainingState ─────────────────────────────────────────────────────
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
@@ -494,6 +504,7 @@ class GoExplore:
             critic_states=gcp_critic_states,
             alpha_state=alpha_state,
             target_critic_params=target_critic_params,
+            normalizer_params=normalizer_params,
             explore_actor_state=explore_actor_state,
             explore_critic_states=explore_critic_states,
             explore_alpha_state=explore_alpha_state,
@@ -680,19 +691,29 @@ class GoExplore:
             raw_state = env_state.obs[:, :state_size]     # (num_envs, state_size)
             in_explore = (phase == 1)                     # (num_envs,)
 
-            # GCP obs: [state, go_goal] — used in both phases when no explore policy
+            # Normalise for network inputs (raw values are stored in the transition)
+            if self.normalize_obs:
+                norm_state = running_statistics.normalize(raw_state, training_state.normalizer_params)
+                norm_goal  = running_statistics.normalize(go_goal,   training_state.normalizer_params)
+                act_obs    = jnp.concatenate([norm_state, norm_goal], axis=-1)
+                act_state  = norm_state
+            else:
+                act_obs   = jnp.concatenate([raw_state, go_goal], axis=-1)
+                act_state = raw_state
+
+            # Raw GCP obs stored in replay buffer (normalisation applied at training time)
             gcp_obs = jnp.concatenate([raw_state, go_goal], axis=-1)
 
             # Go phase: always stochastic, no eps_random
             gcp_actions = gcp_actor.sample_actions(
-                training_state.actor_state.params, gcp_obs, gcp_key, is_deterministic=False
+                training_state.actor_state.params, act_obs, gcp_key, is_deterministic=False
             )
 
             if has_explore_policy:
                 # Explore phase: separate non-goal-conditioned SAC policy, no eps_random
                 explore_actions = explore_actor.sample_actions(
                     training_state.explore_actor_state.params,
-                    raw_state,  # state only, no goal
+                    act_state,  # state only, no goal
                     explore_key,
                     is_deterministic=False,
                 )
@@ -743,6 +764,7 @@ class GoExplore:
                 obs_decoder_params=training_state.obs_decoder_state.params if training_state.obs_decoder_state is not None else None,
                 rssm_params=training_state.rssm_state.params if training_state.rssm_state is not None else None,
                 disag_params=training_state.disag_state.params if training_state.disag_state is not None else None,
+                normalizer_params=training_state.normalizer_params,
             )
 
             key, k_propose, k_roll, k_fork = jax.random.split(key, 4)
@@ -815,6 +837,13 @@ class GoExplore:
             )
             buffer_state = replay_buffer.insert(buffer_state, data)
 
+            # ── Update observation normalizer with raw states from rollout ────
+            normalizer_params = training_state.normalizer_params
+            if self.normalize_obs:
+                # data.observation: (unroll_length, num_envs, obs_size); take state slice only
+                flat_raw_states = data.observation.reshape(-1, obs_size)[:, :state_size]
+                normalizer_params = running_statistics.update(normalizer_params, flat_raw_states)
+
             # ── Macro step update ────────────────────────────────────────────
             macro_new = macro_step + self.unroll_length
 
@@ -886,7 +915,7 @@ class GoExplore:
                 lambda: macro_new,
             )
 
-            return env_state, buffer_state, goal_proposer_state, macro_out
+            return env_state, buffer_state, goal_proposer_state, macro_out, normalizer_params
 
         # ── prefill_replay_buffer ─────────────────────────────────────────────
         def prefill_replay_buffer(training_state, env_state, buffer_state, key,
@@ -894,9 +923,10 @@ class GoExplore:
             def f(carry, _):
                 ts, es, bs, k, gps, ms = carry
                 k, new_k = jax.random.split(k)
-                es, bs, gps, ms = get_experience(ts, es, bs, k, gps, ms)
+                es, bs, gps, ms, norm_p = get_experience(ts, es, bs, k, gps, ms)
                 ts = ts.replace(
                     env_steps=ts.env_steps + config.num_envs * self.unroll_length,
+                    normalizer_params=norm_p,
                 )
                 return (ts, es, bs, new_k, gps, ms), ()
 
@@ -930,6 +960,27 @@ class GoExplore:
                 explore_target_entropy=explore_target_entropy,
             )
             networks = dict(actor=gcp_actor, critic=gcp_critic)
+
+            # ── Normalise transition observations ────────────────────────────
+            # Raw observations are stored in the replay buffer; normalise here
+            # so that all downstream updates (GCP, explore, PEG WM) see
+            # normalised inputs.  Also applies to any RLPD data in the buffer.
+            if self.normalize_obs:
+                norm_p = training_state.normalizer_params
+                def _norm_obs(obs):
+                    state_part = obs[:, :state_size]
+                    goal_part  = obs[:, state_size:]
+                    return jnp.concatenate([
+                        running_statistics.normalize(state_part, norm_p),
+                        running_statistics.normalize(goal_part,  norm_p),
+                    ], axis=-1)
+                transitions = transitions._replace(
+                    observation=_norm_obs(transitions.observation),
+                    next_observation=(
+                        _norm_obs(transitions.next_observation)
+                        if transitions.next_observation is not None else None
+                    ),
+                )
 
             # ── GCP update on ALL transitions ────────────────────────────────
             metrics = {}
@@ -1086,12 +1137,13 @@ class GoExplore:
                           goal_proposer_state, macro_step):
             exp_key, process_key, train_key, rssm_key = jax.random.split(key, 4)
 
-            env_state, buffer_state, updated_gps, macro_next = get_experience(
+            env_state, buffer_state, updated_gps, macro_next, normalizer_params = get_experience(
                 training_state, env_state, buffer_state, exp_key,
                 goal_proposer_state, macro_step,
             )
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
+                normalizer_params=normalizer_params,
             )
 
             # Sample raw trajectories (num_envs, episode_length, ...) for RSSM training
@@ -1176,10 +1228,10 @@ class GoExplore:
             epoch_success_steps = jnp.sum(env_state.info['go_success_steps_total']) - pre_success_steps
 
             go_success_rate = jnp.where(epoch_completions > 0,
-                                        epoch_successes / epoch_completions,
+                                        epoch_successes / jnp.maximum(epoch_completions, 1),
                                         0.0)
             avg_go_steps    = jnp.where(epoch_successes > 0,
-                                        epoch_success_steps / epoch_successes,
+                                        epoch_success_steps / jnp.maximum(epoch_successes, 1),
                                         0.0)
 
             scan_shape = jax.tree_util.tree_leaves(metrics)[0].shape if metrics else (1,)

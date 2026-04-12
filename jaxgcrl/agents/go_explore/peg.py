@@ -410,8 +410,8 @@ def mppi_plan_goal(
                 disag = jnp.std(preds, axis=0).mean(axis=-1)  # (num_samples,)
                 total_reward = total_reward + disag
 
-                # Step using ensemble mean
-                next_states = jnp.mean(preds, axis=0)
+                # Step using ensemble mean; clip to prevent divergence with untrained WM
+                next_states = jnp.clip(jnp.mean(preds, axis=0), -1e3, 1e3)
                 return (next_states, total_reward, rng), None
 
             init_carry = (states, jnp.zeros(num_samples), rng)
@@ -431,8 +431,10 @@ def mppi_plan_goal(
         # Evaluate fitness
         fitness = eval_fitness(goals, eval_rng)
 
-        # MPPI reweighting
-        weights = jax.nn.softmax(gamma * fitness)[:, None]  # (num_samples, 1)
+        # MPPI reweighting — shift by max for numerical stability (log-sum-exp trick)
+        # prevents exp() overflow when fitness values are large (e.g. early untrained WM)
+        fitness_shifted = gamma * (fitness - jnp.max(fitness))
+        weights = jax.nn.softmax(fitness_shifted)[:, None]  # (num_samples, 1)
         new_means = jnp.sum(weights * goals, axis=0)
         new_stds = jnp.sqrt(
             jnp.sum(weights * (goals - new_means[None, :]) ** 2, axis=0) + 1e-6
