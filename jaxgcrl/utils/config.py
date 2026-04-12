@@ -2,12 +2,12 @@ from typing import Literal, Optional, Union
 
 from flax.struct import dataclass
 
-from jaxgcrl.agents import Baseline, CRL, GoExplore, PPO, SAC, TD3
+from jaxgcrl.agents import CRL, GoExplore, PPO, SAC, TD3
 
 from .env import legal_envs
 
 # agent configurations
-AgentConfig = Union[Baseline, CRL, GoExplore, PPO, SAC, TD3]
+AgentConfig = Union[CRL, GoExplore, PPO, SAC, TD3]
 
 
 @dataclass
@@ -40,16 +40,16 @@ class RunConfig:
     env: Literal[legal_envs]
 
     # total number of environment steps to run
-    total_env_steps: int = 50_000_000
+    total_env_steps: int = 100_000_000
 
     # maximum length of an episode
-    episode_length: int = 1001
+    episode_length: int = -1 # Force an error
 
     # environment to use for evaluation
     eval_env: Optional[Literal[legal_envs]] = None
 
     # number of envs to run in parallel during training
-    num_envs: int = 256
+    num_envs: int = 128
 
     # number of envs to run in parallel during evaluation
     num_eval_envs: int = 256

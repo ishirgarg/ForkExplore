@@ -73,6 +73,13 @@ class TrainingState:
     pbe_rms_state: Optional[Any] = None
     # PEG fields (None when neither explore_reward_type="peg" nor goal_proposer_name="peg")
     wm_ensemble_states: Optional[Tuple[TrainState, ...]] = None
+    peg_rms_state: Optional[Any] = None
+    # PEG latent-space fields (None when use_peg_latent_space=False)
+    obs_encoder_state: Optional[TrainState] = None
+    obs_decoder_state: Optional[TrainState] = None
+    # RSSM fields (None when use_rssm=False)
+    rssm_state: Optional[TrainState] = None
+    disag_state: Optional[TrainState] = None
 
 
 class Transition(NamedTuple):
@@ -87,11 +94,37 @@ class Transition(NamedTuple):
 
 
 @dataclass
+class ExploreRewardState:
+    """Carrier for mutable state used by explore reward functions.
+
+    Pack from ``TrainingState`` before calling the reward fn, then unpack the
+    returned state back into ``TrainingState``.  Fields unused by the active
+    reward type will be ``None`` throughout.
+    """
+
+    # q_uncertainty: current explore policy params (read-only inside reward fn)
+    explore_actor_params: Optional[Any] = None
+    explore_critic_states: Optional[Any] = None
+    # tldr: traj encoder + dual lambda + PBE running stats
+    te_state: Optional[TrainState] = None
+    dual_lam_state: Optional[TrainState] = None
+    pbe_rms_state: Optional[Any] = None
+    # peg: world model ensemble + PEG running stats + optional encoder
+    wm_ensemble_states: Optional[Any] = None
+    peg_rms_state: Optional[Any] = None
+    obs_encoder_params: Optional[Any] = None
+
+
+@dataclass
 class GoalProposerState:
     """State for goal proposers that can be read from and written to."""
-    
+
     transitions_sample: Any  # Transition sample from replay buffer
     actor_params: Optional[Any] = None  # Actor network parameters (for q_epistemic)
     critic_params: Optional[Any] = None  # Critic network parameters (for q_epistemic)
     te_params: Optional[Any] = None  # Traj encoder parameters (for TLDR goal proposer)
     wm_ensemble_params: Optional[Any] = None  # World model ensemble params (for PEG goal proposer)
+    obs_encoder_params: Optional[Any] = None  # Encoder params (for latent-space PEG goal proposer)
+    obs_decoder_params: Optional[Any] = None  # Decoder params (for latent-space PEG goal proposer)
+    rssm_params: Optional[Any] = None   # RSSM world model params (for peg_rssm goal proposer)
+    disag_params: Optional[Any] = None  # Disagreement ensemble params (for peg_rssm goal proposer)

@@ -35,7 +35,7 @@ from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 from jaxgcrl.agents.go_explore.visualization import handle_goal_proposer_visualization
 
-from .types import TrainingState, Transition, GoalProposerState
+from .types import TrainingState, Transition, GoalProposerState, ExploreRewardState
 from .algorithms import get_algorithm
 from .utils import (
     save_params,
@@ -50,7 +50,7 @@ from .goal_proposers import (
     create_random_env_goals_proposer,
 )
 from .fork_algo import create_fork_fn
-from .explore_losses import compute_explore_reward
+from .explore_losses import create_explore_reward_fn
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -74,7 +74,7 @@ class GoExplore:
     policy_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
-    batch_size: int = 256
+    batch_size: int = 128
 
     discounting: float = 0.99
     logsumexp_penalty_coeff: float = 0.1
@@ -97,19 +97,18 @@ class GoExplore:
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
 
     tau: float = 0.005
-    n_critics: int = 2
+    n_critics: int = 1
     use_her: bool = True
 
     goal_proposer_name: Literal[
         "random_env_goals", "rb", "q_epistemic", "ucgr",
-        "max_critic_to_env", "mega", "omega", "tldr", "peg",
+        "max_critic_to_env", "mega", "omega", "tldr", "peg", "peg_rssm",
     ] = "random_env_goals"
-    num_candidates: int = 512
+    num_candidates: int = 256
 
     # ── Go Explore specific parameters ──────────────────────────────────────
-    num_gcp_steps: int = 250      # max steps in go phase before forcing explore
-    num_ep_steps: int = 250       # steps in explore phase before reset
-    eps_random_action: float = 0.1  # probability of uniform random action in explore phase
+    num_gcp_steps: int = -1      # max steps in go phase before forcing explore
+    num_ep_steps: int = -1       # steps in explore phase before reset
 
     # ── Explore policy (None = reuse Go policy) ─────────────────────────────
     explore_policy_type: Optional[Literal["sac"]] = None  # "sac" supported; extend as needed
@@ -125,7 +124,8 @@ class GoExplore:
     # ── TLDR hyperparameters (used when explore_reward_type="tldr") ────────
     te_hidden_dim: int = 1024       # traj encoder hidden layer width
     te_hidden_layers: int = 2       # traj encoder hidden layer count
-    te_output_dim: int = 4          # traj encoder latent dimension
+    te_output_dim: int = 2          # traj encoder latent dimension
+    te_layer_norm: bool = False     # traj encoder layer normalisation (default off, matching TLDR)
     te_lr: float = 1e-4             # traj encoder learning rate
     dual_lam_init: float = 30.0     # initial dual Lagrange multiplier
     dual_slack: float = 1e-3        # constraint slack
@@ -134,14 +134,44 @@ class GoExplore:
     knn_clip: float = 0.0001        # distance clipping for PBE
 
     # ── PEG hyperparameters (used when explore_reward_type="peg" or goal_proposer_name="peg")
-    wm_ensemble_size: int = 5       # world model ensemble members
+    wm_ensemble_size: int = 10      # world model ensemble members (original PEG: 10)
     wm_hidden_dim: int = 400        # world model MLP hidden width
-    wm_hidden_layers: int = 3       # world model MLP hidden depth
-    wm_lr: float = 3e-4             # world model learning rate
-    mppi_horizon: int = 50          # MPPI planning horizon
-    mppi_samples: int = 500         # MPPI samples per iteration
+    wm_hidden_layers: int = 4       # world model MLP hidden depth
+    wm_lr: float = 3e-4             # world model learning rate (original PEG: 3e-4)
+    wm_eps: float = 1e-5            # Adam epsilon for world model (original PEG: 1e-5)
+    wm_grad_clip: float = 100.0     # gradient norm clip for world model (original PEG: 100)
+    wm_wd: float = 1e-6             # weight decay for world model (original PEG: 1e-6)
+    mppi_horizon: int = 50          # MPPI planning horizon (original PEG: 50)
+    mppi_samples: int = 500         # MPPI samples per iteration (original PEG: 500)
     mppi_iterations: int = 5        # MPPI optimization steps
     mppi_gamma: float = 10.0        # MPPI temperature
+    # ── PEG latent-space (encoder-decoder) ──────────────────────────────────
+    use_peg_latent_space: bool = False  # enable encoder-decoder latent-space PEG
+    wm_latent_dim: int = 64             # encoder output / WM state dimension
+    enc_hidden_dim: int = 256           # encoder/decoder MLP hidden width
+    enc_hidden_layers: int = 2          # encoder/decoder MLP hidden depth
+    enc_lr: float = 3e-4                # encoder learning rate
+    dec_lr: float = 3e-4                # decoder learning rate
+    enc_recon_coef: float = 1.0         # reconstruction loss weight
+
+    # ── RSSM (DreamerV2-style, replaces WorldModelMLP when use_rssm=True) ───
+    use_rssm: bool = False              # use DreamerV2 RSSM instead of WorldModelMLP
+    rssm_stoch: int = 50               # stochastic state dimension (peg_walker: 50)
+    rssm_deter: int = 200              # GRU deterministic state dimension (peg_walker: 200)
+    rssm_hidden: int = 200             # RSSM MLP hidden width (peg_walker: 200)
+    rssm_min_std: float = 0.1          # minimum std for stochastic state
+    rssm_enc_layers: int = 3           # encoder/decoder MLP depth (peg_walker: 3)
+    rssm_enc_units: int = 400          # encoder/decoder MLP width (peg_walker: 400)
+    rssm_kl_scale: float = 1.0         # KL loss weight
+    rssm_kl_free: float = 1.0          # free-bits threshold (peg_walker: 1.0)
+    rssm_kl_balance: float = 0.8       # KL balance (peg_walker: 0.8)
+    disag_heads: int = 10              # disagreement ensemble size (peg_walker: 10)
+    disag_layers: int = 4              # disagreement head MLP depth (peg_walker: 4)
+    disag_units: int = 400             # disagreement head MLP width (peg_walker: 400)
+    rssm_lr: float = 3e-4             # model + expl optimizer LR (peg_walker: 3e-4)
+    rssm_eps: float = 1e-5            # Adam eps (peg_walker: 1e-5)
+    rssm_clip: float = 100.0          # gradient clip (peg_walker: 100)
+    rssm_wd: float = 1e-6             # weight decay (peg_walker: 1e-6)
 
     # ── Reset proposer (None = initial state distribution) ──────────────────
     reset_proposer_name: Optional[Literal[
@@ -315,6 +345,7 @@ class GoExplore:
                 hidden_dim=self.te_hidden_dim,
                 hidden_layers=self.te_hidden_layers,
                 output_dim=self.te_output_dim,
+                use_layer_norm=self.te_layer_norm,
             )
             key, te_key = jax.random.split(key)
             te_params = traj_encoder_module.init(te_key, jnp.ones([1, state_size]))
@@ -335,16 +366,23 @@ class GoExplore:
                 "n": jnp.asarray(1e-4),
             }
 
-        # ── PEG world model ensemble ─────────────────────────────────────────
+        # ── PEG world model ensemble (+ optional encoder/decoder) ────────────
         wm_ensemble_states = None
         wm_modules = None
+        obs_encoder_module = None
+        obs_decoder_module = None
         use_peg = self.explore_reward_type == "peg" or self.goal_proposer_name == "peg"
 
         if use_peg:
-            from .peg import WorldModelMLP
+            from .peg import ObsDecoder, ObsEncoder, WorldModelMLP
+
+            # When using latent space, WM operates on latent vectors.
+            wm_state_size = self.wm_latent_dim if self.use_peg_latent_space else state_size
+            wm_input_size = wm_state_size + action_size
+
             wm_modules = [
                 WorldModelMLP(
-                    state_size=state_size,
+                    state_size=wm_state_size,
                     hidden_dim=self.wm_hidden_dim,
                     hidden_layers=self.wm_hidden_layers,
                 )
@@ -353,13 +391,91 @@ class GoExplore:
             wm_ensemble_states_list = []
             for i in range(self.wm_ensemble_size):
                 key, wm_key = jax.random.split(key)
-                wm_params = wm_modules[i].init(wm_key, jnp.ones([1, state_size + action_size]))
+                wm_params = wm_modules[i].init(wm_key, jnp.ones([1, wm_input_size]))
+                wm_adam = optax.adam(learning_rate=self.wm_lr, eps=self.wm_eps)
+                wm_tx = optax.chain(
+                    optax.clip_by_global_norm(self.wm_grad_clip),
+                    wm_adam,
+                    optax.add_decayed_weights(self.wm_wd),
+                ) if self.wm_grad_clip > 0 else optax.chain(
+                    wm_adam, optax.add_decayed_weights(self.wm_wd)
+                )
                 wm_ensemble_states_list.append(TrainState.create(
                     apply_fn=wm_modules[i].apply,
                     params=wm_params,
-                    tx=optax.adam(learning_rate=self.wm_lr),
+                    tx=wm_tx,
                 ))
             wm_ensemble_states = tuple(wm_ensemble_states_list)
+
+            if self.use_peg_latent_space:
+                obs_encoder_module = ObsEncoder(
+                    latent_dim=self.wm_latent_dim,
+                    hidden_dim=self.enc_hidden_dim,
+                    hidden_layers=self.enc_hidden_layers,
+                )
+                obs_decoder_module = ObsDecoder(
+                    obs_dim=state_size,
+                    hidden_dim=self.enc_hidden_dim,
+                    hidden_layers=self.enc_hidden_layers,
+                )
+                key, enc_key, dec_key = jax.random.split(key, 3)
+                enc_params = obs_encoder_module.init(enc_key, jnp.ones([1, state_size]))
+                dec_params = obs_decoder_module.init(dec_key, jnp.ones([1, self.wm_latent_dim]))
+                obs_encoder_state = TrainState.create(
+                    apply_fn=obs_encoder_module.apply,
+                    params=enc_params,
+                    tx=optax.adam(learning_rate=self.enc_lr),
+                )
+                obs_decoder_state = TrainState.create(
+                    apply_fn=obs_decoder_module.apply,
+                    params=dec_params,
+                    tx=optax.adam(learning_rate=self.dec_lr),
+                )
+            else:
+                obs_encoder_state = None
+                obs_decoder_state = None
+
+        else:
+            obs_encoder_state = None
+            obs_decoder_state = None
+
+        # Reward normalisation: the original PEG uses StreamNorm(momentum=1.0) which
+        # is explicitly disabled ("momentum of 1 disables normalisation" per DreamerV2).
+        # We match that by keeping peg_rms_state=None so compute_peg_explore_reward
+        # skips the running-mean division entirely.
+        peg_rms_state = None
+
+        # ── RSSM world model (replaces WorldModelMLP when use_rssm=True, or for peg_rssm) ─────
+        rssm_state = None
+        disag_state = None
+        rssm_module = None
+        disag_module = None
+        _use_rssm = self.use_rssm or (self.goal_proposer_name == "peg_rssm")
+
+        if _use_rssm:
+            from .rssm import RSSMWorldModel, DisagreementEnsemble, init_rssm_states
+            rssm_module = RSSMWorldModel(
+                obs_dim=state_size,
+                stoch=self.rssm_stoch,
+                deter=self.rssm_deter,
+                hidden=self.rssm_hidden,
+                min_std=self.rssm_min_std,
+                n_enc_layers=self.rssm_enc_layers,
+                enc_units=self.rssm_enc_units,
+            )
+            disag_module = DisagreementEnsemble(
+                n_heads=self.disag_heads,
+                stoch_size=self.rssm_stoch,
+                n_layers=self.disag_layers,
+                n_units=self.disag_units,
+            )
+            key, rssm_init_key = jax.random.split(key)
+            rssm_state, disag_state = init_rssm_states(
+                rssm_module, disag_module,
+                obs_dim=state_size, action_dim=action_size,
+                key=rssm_init_key,
+                lr=self.rssm_lr, eps=self.rssm_eps, clip=self.rssm_clip, wd=self.rssm_wd,
+            )
 
         # ── TrainingState ─────────────────────────────────────────────────────
         training_state = TrainingState(
@@ -378,6 +494,11 @@ class GoExplore:
             dual_lam_state=dual_lam_state,
             pbe_rms_state=pbe_rms_state,
             wm_ensemble_states=wm_ensemble_states,
+            peg_rms_state=peg_rms_state,
+            obs_encoder_state=obs_encoder_state,
+            obs_decoder_state=obs_decoder_state,
+            rssm_state=rssm_state,
+            disag_state=disag_state,
         )
 
         # ── Goal proposer ────────────────────────────────────────────────────
@@ -399,6 +520,11 @@ class GoExplore:
             mppi_samples=self.mppi_samples,
             mppi_iterations=self.mppi_iterations,
             mppi_gamma=self.mppi_gamma,
+            obs_encoder=obs_encoder_module,
+            obs_decoder=obs_decoder_module,
+            rssm_module=rssm_module,
+            disag_module=disag_module,
+            action_size=action_size,
         )
 
         # ── Reset proposer (optional) ────────────────────────────────────────
@@ -443,6 +569,22 @@ class GoExplore:
                 exploration_metric_name=self.exploration_metric_name,
                 fork_sampling_temperature=self.fork_sampling_temperature,
                 discounting=self.discounting,
+            )
+
+        # ── Explore reward function ──────────────────────────────────────────
+        explore_reward_fn = None
+        if has_explore_policy:
+            explore_reward_fn = create_explore_reward_fn(
+                reward_type=self.explore_reward_type,
+                explore_actor=explore_actor,
+                explore_critic=explore_critic,
+                traj_encoder_module=traj_encoder_module,
+                knn_k=self.knn_k,
+                knn_clip=self.knn_clip,
+                dual_slack=self.dual_slack,
+                wm_modules=wm_modules,
+                obs_encoder_module=obs_encoder_module,
+                use_peg_latent_space=self.use_peg_latent_space,
             )
 
         # ── Env reset ────────────────────────────────────────────────────────
@@ -512,6 +654,10 @@ class GoExplore:
             critic_params={i: cs.params for i, cs in enumerate(gcp_critic_states)},
             te_params=te_state.params if te_state is not None else None,
             wm_ensemble_params=tuple(s.params for s in wm_ensemble_states) if wm_ensemble_states is not None else None,
+            obs_encoder_params=obs_encoder_state.params if obs_encoder_state is not None else None,
+            obs_decoder_params=obs_decoder_state.params if obs_decoder_state is not None else None,
+            rssm_params=rssm_state.params if rssm_state is not None else None,
+            disag_params=disag_state.params if disag_state is not None else None,
         )
 
         # ── actor_step ────────────────────────────────────────────────────────
@@ -585,6 +731,10 @@ class GoExplore:
                 critic_params={i: cs.params for i, cs in enumerate(training_state.critic_states)},
                 te_params=training_state.te_state.params if training_state.te_state is not None else None,
                 wm_ensemble_params=tuple(s.params for s in training_state.wm_ensemble_states) if training_state.wm_ensemble_states is not None else None,
+                obs_encoder_params=training_state.obs_encoder_state.params if training_state.obs_encoder_state is not None else None,
+                obs_decoder_params=training_state.obs_decoder_state.params if training_state.obs_decoder_state is not None else None,
+                rssm_params=training_state.rssm_state.params if training_state.rssm_state is not None else None,
+                disag_params=training_state.disag_state.params if training_state.disag_state is not None else None,
             )
 
             key, k_propose, k_roll, k_fork = jax.random.split(key, 4)
@@ -800,15 +950,31 @@ class GoExplore:
 
             # ── PEG world model training (on ALL transitions) ─────────────────
             if use_peg:
-                from .peg import train_world_model_ensemble as train_wm
                 wm_obs = transitions.observation[:, :state_size]
                 wm_next_obs = transitions.next_observation[:, :state_size]
                 wm_actions = transitions.action
-                new_wm_states, wm_metrics = train_wm(
-                    training_state.wm_ensemble_states, wm_modules,
-                    wm_obs, wm_actions, wm_next_obs,
-                )
-                training_state = training_state.replace(wm_ensemble_states=new_wm_states)
+                if self.use_peg_latent_space:
+                    from .peg import train_encoder_decoder_and_ensemble as train_enc_wm
+                    new_enc_state, new_dec_state, new_wm_states, wm_metrics = train_enc_wm(
+                        training_state.obs_encoder_state,
+                        training_state.obs_decoder_state,
+                        training_state.wm_ensemble_states,
+                        obs_encoder_module, obs_decoder_module, wm_modules,
+                        wm_obs, wm_actions, wm_next_obs,
+                        recon_coef=self.enc_recon_coef,
+                    )
+                    training_state = training_state.replace(
+                        wm_ensemble_states=new_wm_states,
+                        obs_encoder_state=new_enc_state,
+                        obs_decoder_state=new_dec_state,
+                    )
+                else:
+                    from .peg import train_world_model_ensemble as train_wm
+                    new_wm_states, wm_metrics = train_wm(
+                        training_state.wm_ensemble_states, wm_modules,
+                        wm_obs, wm_actions, wm_next_obs,
+                    )
+                    training_state = training_state.replace(wm_ensemble_states=new_wm_states)
                 for k, v in wm_metrics.items():
                     metrics[k] = v
 
@@ -820,49 +986,40 @@ class GoExplore:
                 phase = transitions.extras["state_extras"]["phase"]
                 phase_mask = (phase == 1).astype(jnp.float32)
 
-                # Compute intrinsic reward based on explore_reward_type
+                # Compute intrinsic reward via the factory-created reward fn
                 explore_obs = transitions.observation[:, :state_size]
                 explore_next_obs = transitions.next_observation[:, :state_size]
 
-                if self.explore_reward_type == "tldr":
-                    from .tldr import compute_pbe_intrinsic_reward, update_traj_encoder
-
-                    # Train traj encoder + dual lambda on this batch
-                    new_te_state, new_dual_lam_state, te_metrics = update_traj_encoder(
-                        training_state.te_state, training_state.dual_lam_state,
-                        traj_encoder_module, explore_obs, explore_next_obs, self.dual_slack,
+                if _use_rssm and "rssm_reward" in transitions.extras.get("state_extras", {}):
+                    # RSSM rewards were pre-computed on the raw trajectories and attached
+                    # to state_extras before process_transitions; retrieve them here.
+                    explore_reward = transitions.extras["state_extras"]["rssm_reward"]
+                    reward_metrics = {}
+                else:
+                    reward_state = ExploreRewardState(
+                        explore_actor_params=training_state.explore_actor_state.params,
+                        explore_critic_states=training_state.explore_critic_states,
+                        te_state=training_state.te_state,
+                        dual_lam_state=training_state.dual_lam_state,
+                        pbe_rms_state=training_state.pbe_rms_state,
+                        wm_ensemble_states=training_state.wm_ensemble_states,
+                        peg_rms_state=training_state.peg_rms_state,
+                        obs_encoder_params=(
+                            training_state.obs_encoder_state.params
+                            if training_state.obs_encoder_state is not None else None
+                        ),
+                    )
+                    explore_reward, reward_state, reward_metrics = explore_reward_fn(
+                        reward_state, explore_obs, explore_next_obs, transitions.action, reward_key,
                     )
                     training_state = training_state.replace(
-                        te_state=new_te_state, dual_lam_state=new_dual_lam_state,
+                        te_state=reward_state.te_state,
+                        dual_lam_state=reward_state.dual_lam_state,
+                        pbe_rms_state=reward_state.pbe_rms_state,
+                        peg_rms_state=reward_state.peg_rms_state,
                     )
-
-                    # Compute PBE intrinsic reward
-                    explore_reward, new_rms = compute_pbe_intrinsic_reward(
-                        new_te_state.params, traj_encoder_module,
-                        explore_obs, explore_next_obs,
-                        self.knn_k, self.knn_clip, training_state.pbe_rms_state,
-                    )
-                    explore_reward = jax.lax.stop_gradient(explore_reward)
-                    training_state = training_state.replace(pbe_rms_state=new_rms)
-                    for k, v in te_metrics.items():
-                        metrics[f"explore_{k}"] = v
-                elif self.explore_reward_type == "peg":
-                    from .peg import compute_peg_explore_reward
-                    explore_reward = jax.lax.stop_gradient(
-                        compute_peg_explore_reward(
-                            training_state.wm_ensemble_states, wm_modules,
-                            explore_obs, transitions.action,
-                        )
-                    )
-                else:  # q_uncertainty (default)
-                    explore_reward = jax.lax.stop_gradient(
-                        compute_explore_reward(
-                            explore_actor, explore_critic,
-                            training_state.explore_actor_state.params,
-                            training_state.explore_critic_states,
-                            explore_obs, reward_key,
-                        )
-                    )
+                for k, v in reward_metrics.items():
+                    metrics[f"explore_{k}"] = v
                 explore_transitions = transitions._replace(
                     observation=explore_obs,
                     next_observation=explore_next_obs,
@@ -919,7 +1076,7 @@ class GoExplore:
         @jax.jit
         def training_step(training_state, env_state, buffer_state, key,
                           goal_proposer_state, macro_step):
-            exp_key, process_key, train_key = jax.random.split(key, 3)
+            exp_key, process_key, train_key, rssm_key = jax.random.split(key, 4)
 
             env_state, buffer_state, updated_gps, macro_next = get_experience(
                 training_state, env_state, buffer_state, exp_key,
@@ -929,16 +1086,56 @@ class GoExplore:
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
             )
 
-            # GCP update on all transitions
-            buffer_state, transitions = replay_buffer.sample(buffer_state)
+            # Sample raw trajectories (num_envs, episode_length, ...) for RSSM training
+            # and GCP update.  RSSM training happens BEFORE process_transitions flattening.
+            buffer_state, raw_transitions = replay_buffer.sample(buffer_state)
+
+            # ── RSSM training on raw trajectories ────────────────────────────
+            if _use_rssm:
+                from .rssm import train_rssm_step as _train_rssm
+                rssm_obs = raw_transitions.observation[:, :, :state_size]
+                rssm_act = raw_transitions.action
+                new_rssm_st, new_disag_st, rssm_rewards, rssm_metrics = _train_rssm(
+                    training_state.rssm_state,
+                    training_state.disag_state,
+                    rssm_module,
+                    disag_module,
+                    rssm_obs,
+                    rssm_act,
+                    rssm_key,
+                    kl_scale=self.rssm_kl_scale,
+                    kl_free=self.rssm_kl_free,
+                    kl_balance=self.rssm_kl_balance,
+                )
+                training_state = training_state.replace(
+                    rssm_state=new_rssm_st,
+                    disag_state=new_disag_st,
+                )
+                # Attach rssm_rewards to raw_transitions before flattening so that
+                # update_networks can retrieve them keyed by "rssm_reward".
+                old_se = raw_transitions.extras["state_extras"]
+                new_se = {**old_se, "rssm_reward": rssm_rewards}
+                raw_transitions = raw_transitions._replace(
+                    extras={"state_extras": new_se}
+                )
+
+            # Flatten and process for GCP + explore policy updates
             transitions, _ = gcp_actor.process_transitions(
-                transitions, process_key, self.batch_size, self.discounting,
+                raw_transitions, process_key, self.batch_size, self.discounting,
                 state_size, tuple(train_env.goal_indices),
                 train_env.goal_reach_thresh, self.use_her,
             )
             (training_state, _), metrics = jax.lax.scan(
                 update_networks, (training_state, train_key), transitions
             )
+
+            if _use_rssm:
+                # update_networks scan produces (num_batches,) shaped metrics;
+                # expand RSSM scalars to match so training_epoch's outer scan
+                # can stack them uniformly.
+                num_batches = jax.tree_util.tree_leaves(metrics)[0].shape[0]
+                for k, v in rssm_metrics.items():
+                    metrics[k] = jnp.full((num_batches,), v)
 
             return (training_state, env_state, buffer_state, updated_gps, macro_next), metrics
 

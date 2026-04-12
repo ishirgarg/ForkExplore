@@ -14,30 +14,57 @@ from typing import Any, Dict, Tuple
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-from flax.linen.initializers import variance_scaling
 from flax.training.train_state import TrainState
 
 
 # ── TrajEncoder network ─────────────────────────────────────────────────────
 
 class TrajEncoder(nn.Module):
-    """MLP mapping observations to a latent representation for temporal distance."""
+    """Gaussian MLP mapping observations to a latent representation for temporal distance.
+
+    Matches the original ``GaussianMLPIndependentStdModuleEx`` from TLDR:
+    two independent sub-networks (mean head and std head) each with
+    ``hidden_layers`` hidden layers of width ``hidden_dim``.  Only the mean is
+    returned from ``__call__`` because the original always accesses
+    ``traj_encoder(obs).mean`` — the std head exists for architectural parity
+    (same parameter count) but receives no gradient in TLDR's loss.
+
+    ``use_layer_norm`` defaults to ``False`` to match the original default
+    (``--traj_encoder_layer_normalization`` defaults to ``None`` / off).
+    """
 
     hidden_dim: int = 1024
     hidden_layers: int = 2
-    output_dim: int = 4
+    output_dim: int = 2
+    use_layer_norm: bool = False
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
-        lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
+        xavier_uniform = nn.initializers.glorot_uniform()
         bias_init = nn.initializers.zeros
+
+        # ── Mean head ────────────────────────────────────────────────────────
         x = obs
-        for i in range(self.hidden_layers):
-            x = nn.Dense(self.hidden_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
-            x = nn.LayerNorm()(x)
+        for _ in range(self.hidden_layers):
+            x = nn.Dense(self.hidden_dim, kernel_init=xavier_uniform, bias_init=bias_init)(x)
+            if self.use_layer_norm:
+                x = nn.LayerNorm()(x)
             x = nn.relu(x)
-        x = nn.Dense(self.output_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
-        return x
+        mean = nn.Dense(self.output_dim, kernel_init=xavier_uniform, bias_init=bias_init)(x)
+
+        # ── Std head (independent hidden layers, not used in any loss) ───────
+        # Matches GaussianMLPIndependentStdModuleEx where std_hidden_sizes ==
+        # hidden_sizes.  Since only .mean is used downstream, these parameters
+        # exist but receive zero gradient — identical to the original behaviour.
+        x_std = obs
+        for _ in range(self.hidden_layers):
+            x_std = nn.Dense(self.hidden_dim, kernel_init=xavier_uniform, bias_init=bias_init)(x_std)
+            if self.use_layer_norm:
+                x_std = nn.LayerNorm()(x_std)
+            x_std = nn.relu(x_std)
+        nn.Dense(self.output_dim, kernel_init=xavier_uniform, bias_init=bias_init)(x_std)  # log_std (unused)
+
+        return mean
 
 
 # ── PBE (Particle-Based Entropy) ────────────────────────────────────────────

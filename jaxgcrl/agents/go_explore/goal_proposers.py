@@ -25,6 +25,11 @@ def create_goal_proposer(
     mppi_samples: int = 500,
     mppi_iterations: int = 5,
     mppi_gamma: float = 10.0,
+    obs_encoder: Optional[Any] = None,
+    obs_decoder: Optional[Any] = None,
+    rssm_module: Optional[Any] = None,
+    disag_module: Optional[Any] = None,
+    action_size: Optional[int] = None,
 ) -> Callable:
     """
     Factory function to create a goal proposer function.
@@ -72,7 +77,12 @@ def create_goal_proposer(
         return create_tldr_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, traj_encoder, knn_k, knn_clip)
     elif goal_proposer_name == "peg":
         return create_peg_goal_proposer(env, num_envs, state_size, goal_indices, actor, wm_modules,
-                                        mppi_horizon, mppi_samples, mppi_iterations, mppi_gamma)
+                                        mppi_horizon, mppi_samples, mppi_iterations, mppi_gamma,
+                                        obs_encoder=obs_encoder, obs_decoder=obs_decoder)
+    elif goal_proposer_name == "peg_rssm":
+        return create_peg_rssm_goal_proposer(env, state_size, goal_indices, actor, rssm_module,
+                                             disag_module, action_size,
+                                             mppi_horizon, mppi_samples, mppi_iterations, mppi_gamma)
     else:
         raise ValueError(f"Unknown goal proposer: {goal_proposer_name}")
 
@@ -699,17 +709,18 @@ def create_tldr_goal_proposer(
         transitions_sample = goal_proposer_state.transitions_sample
         te_params = goal_proposer_state.te_params
 
-        # Flatten buffer observations → (N, obs_size)
-        obs_flat = jnp.reshape(
-            transitions_sample.observation,
-            (-1, transitions_sample.observation.shape[-1]),
+        # Flatten buffer next_observations → (N, obs_size).
+        # Original TLDR get_random_goals encodes next_obs, not obs.
+        next_obs_flat = jnp.reshape(
+            transitions_sample.next_observation,
+            (-1, transitions_sample.next_observation.shape[-1]),
         )
-        n_buf = obs_flat.shape[0]
+        n_buf = next_obs_flat.shape[0]
 
         # Sample num_candidates random indices from buffer
         rng, sample_rng = jax.random.split(rng)
         cand_indices = jax.random.randint(sample_rng, (num_candidates,), 0, n_buf)
-        candidate_obs = obs_flat[cand_indices]  # (num_candidates, obs_size)
+        candidate_obs = next_obs_flat[cand_indices]  # (num_candidates, obs_size)
         candidate_states = candidate_obs[:, :state_size]  # raw state only
 
         # Score candidates by PBE novelty in latent space
@@ -739,8 +750,12 @@ def create_tldr_goal_proposer(
 def create_peg_goal_proposer(
     env, num_envs, state_size, goal_indices, gcp_actor, wm_modules,
     mppi_horizon, mppi_samples, mppi_iterations, mppi_gamma,
+    obs_encoder=None, obs_decoder=None,
 ):
     """Plan goals via MPPI through the world model to maximise disagreement.
+
+    When ``obs_encoder`` and ``obs_decoder`` are provided, the MPPI rollout
+    operates in latent space (latent-space PEG).
 
     Reference: ``peg/dreamerv2/goal_picker.py`` SubgoalPlanner.
     """
@@ -748,18 +763,85 @@ def create_peg_goal_proposer(
 
     goal_idx_array = jnp.array(goal_indices)
     goal_dim = len(goal_indices)
-    goal_min = jnp.array(env.x_bounds[:1] + env.y_bounds[:1], dtype=jnp.float32)
-    goal_max = jnp.array(env.x_bounds[1:] + env.y_bounds[1:], dtype=jnp.float32)
+    goal_min = jnp.concatenate([env.x_bounds[:1], env.y_bounds[:1]])
+    goal_max = jnp.concatenate([env.x_bounds[1:], env.y_bounds[1:]])
 
     def propose_goal(rng, start_obs, goal_proposer_state):
         actor_params = goal_proposer_state.actor_params
         wm_params_list = goal_proposer_state.wm_ensemble_params
+        enc_params = goal_proposer_state.obs_encoder_params
+        dec_params = goal_proposer_state.obs_decoder_params
         current_state = start_obs[:state_size]
+
+        # Seed MPPI from the agent's current goal-space position, matching the
+        # original PEG get_distribution_from_obs initialisation.
+        current_goal_pos = current_state[goal_idx_array]  # (goal_dim,)
 
         planned_goal = mppi_plan_goal(
             gcp_actor, actor_params,
             wm_modules, wm_params_list,
             current_state, goal_dim, goal_min, goal_max,
+            mppi_samples, mppi_horizon, mppi_iterations, mppi_gamma,
+            rng,
+            init_means=current_goal_pos,
+            obs_encoder=obs_encoder,
+            obs_encoder_params=enc_params,
+            obs_decoder=obs_decoder,
+            obs_decoder_params=dec_params,
+        )
+
+        log_data = {
+            "first_obs_position": current_state[goal_idx_array],
+            "selected_goal": planned_goal,
+        }
+        return planned_goal, goal_proposer_state, log_data
+
+    return propose_goal
+
+
+# ── PEG-RSSM goal proposer (MPPI planning through DreamerV2 RSSM) ────────────
+
+def create_peg_rssm_goal_proposer(
+    env,
+    state_size: int,
+    goal_indices,
+    gcp_actor,
+    rssm_module,
+    disag_module,
+    action_size: int,
+    mppi_horizon: int = 50,
+    mppi_samples: int = 500,
+    mppi_iterations: int = 5,
+    mppi_gamma: float = 10.0,
+):
+    """Plan goals via MPPI through the DreamerV2 RSSM imagination.
+
+    Uses the RSSM's learned world model to imagine future trajectories and
+    scores them via the disagreement ensemble (Plan2Explore-style reward).
+
+    Requires ``goal_proposer_state.rssm_params`` and
+    ``goal_proposer_state.disag_params`` to be set (non-None).
+
+    Reference: ``peg/dreamerv2/goal_picker.py`` SubgoalPlanner + expl.py Plan2Explore.
+    """
+    from .rssm import mppi_plan_goal_rssm
+
+    goal_idx_array = jnp.array(goal_indices)
+    goal_dim = len(goal_indices)
+    goal_min = jnp.concatenate([env.x_bounds[:1], env.y_bounds[:1]])
+    goal_max = jnp.concatenate([env.x_bounds[1:], env.y_bounds[1:]])
+
+    def propose_goal(rng, start_obs, goal_proposer_state):
+        actor_params = goal_proposer_state.actor_params
+        rssm_params = goal_proposer_state.rssm_params
+        disag_params = goal_proposer_state.disag_params
+        current_state = start_obs[:state_size]
+
+        planned_goal = mppi_plan_goal_rssm(
+            gcp_actor, actor_params,
+            rssm_params, disag_params,
+            rssm_module, disag_module,
+            current_state, action_size, goal_dim, goal_min, goal_max,
             mppi_samples, mppi_horizon, mppi_iterations, mppi_gamma,
             rng,
         )
