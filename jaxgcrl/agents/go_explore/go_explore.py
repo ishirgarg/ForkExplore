@@ -116,6 +116,7 @@ class GoExplore:
     explore_policy_lr: float = 3e-4
     explore_critic_lr: float = 3e-4
     explore_alpha_lr: float = 3e-4
+    explore_grad_clip: float = 100.0   # gradient norm clip for explore policy (original PEG expl_opt.clip: 100)
     explore_eps_random_action: float = 0.2  # eps_random when explore_policy_type is None
 
     # ── Explore reward type ────────────────────────────────────────────────
@@ -320,16 +321,23 @@ class GoExplore:
             explore_actor_state = TrainState.create(
                 apply_fn=explore_actor.apply,
                 params=explore_actor_params,
-                tx=optax.adam(learning_rate=self.explore_policy_lr),
+                tx=optax.chain(
+                    optax.clip_by_global_norm(self.explore_grad_clip),
+                    optax.adam(learning_rate=self.explore_policy_lr, eps=1e-5),
+                ),
             )
             explore_critic_states = explore_critic.create_critic_states(
-                explore_critic_params, self.explore_critic_lr
+                explore_critic_params, self.explore_critic_lr,
+                grad_clip=self.explore_grad_clip,
             )
             explore_log_alpha = jnp.asarray(0.0, dtype=jnp.float32)
             explore_alpha_state = TrainState.create(
                 apply_fn=None,
                 params={"log_alpha": explore_log_alpha},
-                tx=optax.adam(learning_rate=self.explore_alpha_lr),
+                tx=optax.chain(
+                    optax.clip_by_global_norm(self.explore_grad_clip),
+                    optax.adam(learning_rate=self.explore_alpha_lr, eps=1e-5),
+                ),
             )
             explore_target_critic_params = explore_critic_params
 

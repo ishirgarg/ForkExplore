@@ -232,7 +232,7 @@ class CRLCritic(Critic):
             params[f"g_encoder_{i}"] = g_params
         return params
     
-    def create_critic_states(self, critic_params: dict, learning_rate: float) -> Tuple[TrainState, ...]:
+    def create_critic_states(self, critic_params: dict, learning_rate: float, grad_clip: float = 0.0) -> Tuple[TrainState, ...]:
         """Create separate TrainState for each critic from full critic params (CRL structure)."""
         critic_states = []
         for i in range(self.n_critics):
@@ -240,10 +240,17 @@ class CRLCritic(Critic):
                 "sa_encoder": critic_params[f"sa_encoder_{i}"],
                 "g_encoder": critic_params[f"g_encoder_{i}"],
             }
+            if grad_clip > 0:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(grad_clip),
+                    optax.adam(learning_rate=learning_rate, eps=1e-5),
+                )
+            else:
+                tx = optax.adam(learning_rate=learning_rate)
             critic_i_state = TrainState.create(
                 apply_fn=None,  # Not needed for individual critic updates
                 params=critic_i_params,
-                tx=optax.adam(learning_rate=learning_rate),
+                tx=tx,
             )
             critic_states.append(critic_i_state)
         return tuple(critic_states)
@@ -385,7 +392,7 @@ class SACCritic(Critic):
         # params is the inner dict (unwrapped), need to wrap it for Flax network.apply()
         return self.network.apply({"params": params}, obs, actions)
     
-    def create_critic_states(self, critic_params: dict, learning_rate: float) -> Tuple[TrainState, ...]:
+    def create_critic_states(self, critic_params: dict, learning_rate: float, grad_clip: float = 0.0) -> Tuple[TrainState, ...]:
         """Create separate TrainState for each critic from full critic params (SAC structure)."""
         critic_states = []
         for i in range(self.n_critics):
@@ -396,10 +403,17 @@ class SACCritic(Critic):
                     # Remove the "critic_{i}_" prefix to get the layer name
                     layer_name = key[len(f"critic_{i}_"):]
                     critic_i_params[layer_name] = value
+            if grad_clip > 0:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(grad_clip),
+                    optax.adam(learning_rate=learning_rate, eps=1e-5),
+                )
+            else:
+                tx = optax.adam(learning_rate=learning_rate)
             critic_i_state = TrainState.create(
                 apply_fn=None,  # Not needed for individual critic updates
                 params=critic_i_params,
-                tx=optax.adam(learning_rate=learning_rate),
+                tx=tx,
             )
             critic_states.append(critic_i_state)
         return tuple(critic_states)

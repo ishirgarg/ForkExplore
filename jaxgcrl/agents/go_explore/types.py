@@ -34,7 +34,7 @@ class Critic:
     def update(self,  context, networks, transitions, training_state, critic_key):
         pass
     
-    def create_critic_states(self, critic_params: dict, learning_rate: float) -> Tuple[TrainState, ...]:
+    def create_critic_states(self, critic_params: dict, learning_rate: float, grad_clip: float = 0.0) -> Tuple[TrainState, ...]:
         """Create separate TrainState for each critic from full critic params.
         
         Args:

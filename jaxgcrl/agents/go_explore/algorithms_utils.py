@@ -1,6 +1,32 @@
 """Utility functions for algorithm-specific parameter handling."""
 
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
+
+import jax.numpy as jnp
+
+
+def welford_update(
+    rms_state: Dict[str, "jnp.ndarray"],
+    x: "jnp.ndarray",
+) -> Tuple[Dict[str, "jnp.ndarray"], "jnp.ndarray"]:
+    """Welford's online mean/variance update.
+
+    Args:
+        rms_state: ``{"M": mean, "S": variance, "n": count}``
+        x: ``(N, 1)`` new samples.
+
+    Returns:
+        ``(new_rms_state, mean)``
+    """
+    M, S, n = rms_state["M"], rms_state["S"], rms_state["n"]
+    bs = x.shape[0]
+    delta = jnp.mean(x, axis=0) - M
+    new_M = M + delta * bs / (n + bs)
+    new_S = (
+        S * n + jnp.var(x, axis=0) * bs + jnp.square(delta) * n * bs / (n + bs)
+    ) / (n + bs)
+    new_n = n + bs
+    return {"M": new_M, "S": new_S, "n": new_n}, new_M
 
 
 def reconstruct_full_critic_params(critic_params: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:

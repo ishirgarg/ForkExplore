@@ -16,6 +16,8 @@ import jax
 import jax.numpy as jnp
 from flax.training.train_state import TrainState
 
+from jaxgcrl.agents.go_explore.algorithms_utils import welford_update
+
 
 # ── TrajEncoder network ─────────────────────────────────────────────────────
 
@@ -52,10 +54,8 @@ class TrajEncoder(nn.Module):
             x = nn.relu(x)
         mean = nn.Dense(self.output_dim, kernel_init=xavier_uniform, bias_init=bias_init)(x)
 
-        # ── Std head (independent hidden layers, not used in any loss) ───────
-        # Matches GaussianMLPIndependentStdModuleEx where std_hidden_sizes ==
-        # hidden_sizes.  Since only .mean is used downstream, these parameters
-        # exist but receive zero gradient — identical to the original behaviour.
+        # ── Std head (independent; exists for parameter-count parity with the
+        # reference GaussianMLPIndependentStdModuleEx, but receives no gradient)
         x_std = obs
         for _ in range(self.hidden_layers):
             x_std = nn.Dense(self.hidden_dim, kernel_init=xavier_uniform, bias_init=bias_init)(x_std)
@@ -68,30 +68,6 @@ class TrajEncoder(nn.Module):
 
 
 # ── PBE (Particle-Based Entropy) ────────────────────────────────────────────
-
-def pbe_rms_update(
-    rms_state: Dict[str, jnp.ndarray],
-    x: jnp.ndarray,
-) -> Tuple[Dict[str, jnp.ndarray], jnp.ndarray]:
-    """Welford's online mean/variance update.
-
-    Args:
-        rms_state: ``{"M": mean, "S": variance, "n": count}``
-        x: ``(N, 1)`` new samples.
-
-    Returns:
-        ``(new_rms_state, mean)``
-    """
-    M, S, n = rms_state["M"], rms_state["S"], rms_state["n"]
-    bs = x.shape[0]
-    delta = jnp.mean(x, axis=0) - M
-    new_M = M + delta * bs / (n + bs)
-    new_S = (
-        S * n + jnp.var(x, axis=0) * bs + jnp.square(delta) * n * bs / (n + bs)
-    ) / (n + bs)
-    new_n = n + bs
-    return {"M": new_M, "S": new_S, "n": new_n}, new_M
-
 
 def pbe_get_reward(
     source: jnp.ndarray,
@@ -124,7 +100,7 @@ def pbe_get_reward(
     # RMS normalisation (before clipping, matching TLDR)
     if rms_state is not None:
         reward_flat = reward.reshape(-1, 1)  # (B1*K, 1)
-        rms_state, rms_mean = pbe_rms_update(rms_state, reward_flat)
+        rms_state, rms_mean = welford_update(rms_state, reward_flat)
         reward_flat = reward_flat / jnp.maximum(rms_mean, 1e-8)
         reward = reward_flat.reshape(b1, knn_k)
 
@@ -149,8 +125,8 @@ def compute_pbe_intrinsic_reward(
     Returns:
         ``(rewards (B,), new_rms_state)``
     """
-    rep = traj_encoder.apply(te_params, obs)
-    next_rep = traj_encoder.apply(te_params, next_obs)
+    both = traj_encoder.apply(te_params, jnp.concatenate([obs, next_obs], axis=0))
+    rep, next_rep = jnp.split(both, 2, axis=0)
     target = rep  # self-similarity within the batch
     r1, rms_state = pbe_get_reward(rep, target, knn_k, knn_clip, rms_state)
     r2, rms_state = pbe_get_reward(next_rep, target, knn_k, knn_clip, rms_state)

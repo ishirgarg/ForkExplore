@@ -18,6 +18,8 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from flax.linen.initializers import variance_scaling
+
+from jaxgcrl.agents.go_explore.algorithms_utils import welford_update
 from flax.training.train_state import TrainState
 
 
@@ -229,32 +231,6 @@ def train_encoder_decoder_and_ensemble(
     return new_enc_state, new_dec_state, tuple(new_wm_states), metrics
 
 
-# ── PEG reward normalisation ────────────────────────────────────────────────
-
-def _peg_rms_update(
-    rms_state: Dict[str, jnp.ndarray],
-    x: jnp.ndarray,
-) -> Tuple[Dict[str, jnp.ndarray], jnp.ndarray]:
-    """Welford online mean/variance update for PEG reward normalisation.
-
-    Args:
-        rms_state: ``{"M": mean, "S": variance, "n": count}``
-        x: ``(N, 1)`` new samples.
-
-    Returns:
-        ``(new_rms_state, mean)``
-    """
-    M, S, n = rms_state["M"], rms_state["S"], rms_state["n"]
-    bs = x.shape[0]
-    delta = jnp.mean(x, axis=0) - M
-    new_M = M + delta * bs / (n + bs)
-    new_S = (
-        S * n + jnp.var(x, axis=0) * bs + jnp.square(delta) * n * bs / (n + bs)
-    ) / (n + bs)
-    new_n = n + bs
-    return {"M": new_M, "S": new_S, "n": new_n}, new_M
-
-
 # ── Disagreement reward ─────────────────────────────────────────────────────
 
 def compute_peg_explore_reward(
@@ -297,7 +273,7 @@ def compute_peg_explore_reward(
     disag = jnp.std(preds, axis=0).mean(axis=-1)  # (batch,)
 
     if rms_state is not None:
-        rms_state, rms_mean = _peg_rms_update(rms_state, disag[:, None])
+        rms_state, rms_mean = welford_update(rms_state, disag[:, None])
         disag = disag / jnp.maximum(rms_mean[0], 1e-8)
 
     return disag, rms_state
