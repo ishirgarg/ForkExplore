@@ -15,7 +15,6 @@ import time
 from typing import Callable, Literal, Optional, Tuple, Union
 
 import jax
-jax.config.update("jax_debug_nans", True)
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -130,8 +129,8 @@ class GoExplore:
     te_hidden_layers: int = 2       # traj encoder hidden layer count
     te_output_dim: int = 2          # traj encoder latent dimension
     te_layer_norm: bool = False     # traj encoder layer normalisation (default off, matching TLDR)
-    te_lr: float = 1e-4             # traj encoder learning rate
-    dual_lam_init: float = 30.0     # initial dual Lagrange multiplier
+    te_lr: float = 5e-4             # traj encoder learning rate
+    dual_lam_init: float = 3000.0     # initial dual Lagrange multiplier
     dual_slack: float = 1e-3        # constraint slack
     dual_lr: float = 1e-4           # dual lambda learning rate
     knn_k: int = 12                 # K nearest neighbors for PBE
@@ -489,10 +488,12 @@ class GoExplore:
             )
 
         # ── Observation normalizer ────────────────────────────────────────────
+        # Track stats over the full obs_size (state + goal) so both halves of
+        # gcp_obs are independently normalised without shape mismatches.
         normalizer_params = None
         if self.normalize_obs:
             normalizer_params = running_statistics.init_state(
-                brax_specs.Array((state_size,), jnp.dtype("float32"))
+                brax_specs.Array((obs_size,), jnp.dtype("float32"))
             )
 
         # ── TrainingState ─────────────────────────────────────────────────────
@@ -677,6 +678,7 @@ class GoExplore:
             obs_decoder_params=obs_decoder_state.params if obs_decoder_state is not None else None,
             rssm_params=rssm_state.params if rssm_state is not None else None,
             disag_params=disag_state.params if disag_state is not None else None,
+            normalizer_params=normalizer_params,
         )
 
         # ── actor_step ────────────────────────────────────────────────────────
@@ -691,18 +693,16 @@ class GoExplore:
             raw_state = env_state.obs[:, :state_size]     # (num_envs, state_size)
             in_explore = (phase == 1)                     # (num_envs,)
 
-            # Normalise for network inputs (raw values are stored in the transition)
-            if self.normalize_obs:
-                norm_state = running_statistics.normalize(raw_state, training_state.normalizer_params)
-                norm_goal  = running_statistics.normalize(go_goal,   training_state.normalizer_params)
-                act_obs    = jnp.concatenate([norm_state, norm_goal], axis=-1)
-                act_state  = norm_state
-            else:
-                act_obs   = jnp.concatenate([raw_state, go_goal], axis=-1)
-                act_state = raw_state
-
             # Raw GCP obs stored in replay buffer (normalisation applied at training time)
-            gcp_obs = jnp.concatenate([raw_state, go_goal], axis=-1)
+            gcp_obs = jnp.concatenate([raw_state, go_goal], axis=-1)  # (num_envs, obs_size)
+
+            # Normalise full gcp_obs for network inputs; explore actor gets the state slice
+            if self.normalize_obs:
+                act_obs   = running_statistics.normalize(gcp_obs, training_state.normalizer_params)
+                act_state = act_obs[:, :state_size]
+            else:
+                act_obs   = gcp_obs
+                act_state = raw_state
 
             # Go phase: always stochastic, no eps_random
             gcp_actions = gcp_actor.sample_actions(
@@ -837,12 +837,12 @@ class GoExplore:
             )
             buffer_state = replay_buffer.insert(buffer_state, data)
 
-            # ── Update observation normalizer with raw states from rollout ────
+            # ── Update observation normalizer with raw obs from rollout ──────
             normalizer_params = training_state.normalizer_params
             if self.normalize_obs:
-                # data.observation: (unroll_length, num_envs, obs_size); take state slice only
-                flat_raw_states = data.observation.reshape(-1, obs_size)[:, :state_size]
-                normalizer_params = running_statistics.update(normalizer_params, flat_raw_states)
+                # data.observation: (unroll_length, num_envs, obs_size)
+                flat_raw_obs = data.observation.reshape(-1, obs_size)
+                normalizer_params = running_statistics.update(normalizer_params, flat_raw_obs)
 
             # ── Macro step update ────────────────────────────────────────────
             macro_new = macro_step + self.unroll_length
@@ -967,20 +967,24 @@ class GoExplore:
             # normalised inputs.  Also applies to any RLPD data in the buffer.
             if self.normalize_obs:
                 norm_p = training_state.normalizer_params
-                def _norm_obs(obs):
-                    state_part = obs[:, :state_size]
-                    goal_part  = obs[:, state_size:]
-                    return jnp.concatenate([
-                        running_statistics.normalize(state_part, norm_p),
-                        running_statistics.normalize(goal_part,  norm_p),
-                    ], axis=-1)
                 transitions = transitions._replace(
-                    observation=_norm_obs(transitions.observation),
+                    observation=running_statistics.normalize(transitions.observation, norm_p),
                     next_observation=(
-                        _norm_obs(transitions.next_observation)
+                        running_statistics.normalize(transitions.next_observation, norm_p)
                         if transitions.next_observation is not None else None
                     ),
                 )
+                # CRL flatten_batch leaves a raw `future_state` (state-dim only) in
+                # extras, which the CRL actor loss consumes — normalise the state
+                # slice of the obs normaliser before reading it.
+                if self.agent_type == "crl" and "future_state" in transitions.extras:
+                    state_mean = norm_p.mean[:state_size]
+                    state_std  = norm_p.std[:state_size]
+                    new_extras = dict(transitions.extras)
+                    new_extras["future_state"] = (
+                        transitions.extras["future_state"] - state_mean
+                    ) / state_std
+                    transitions = transitions._replace(extras=new_extras)
 
             # ── GCP update on ALL transitions ────────────────────────────────
             metrics = {}
@@ -1150,11 +1154,18 @@ class GoExplore:
             # and GCP update.  RSSM training happens BEFORE process_transitions flattening.
             buffer_state, raw_transitions = replay_buffer.sample(buffer_state)
 
-            # ── RSSM training on raw trajectories ────────────────────────────
+            # ── RSSM training on (optionally normalised) state trajectories ──
             if _use_rssm:
                 from .rssm import train_rssm_step as _train_rssm
                 rssm_obs = raw_transitions.observation[:, :, :state_size]
                 rssm_act = raw_transitions.action
+                if self.normalize_obs:
+                    # Apply the state-prefix of the obs normaliser so RSSM trains
+                    # in the same space the GCP actor (and the peg_rssm planner) sees.
+                    norm_p = training_state.normalizer_params
+                    state_mean = norm_p.mean[:state_size]
+                    state_std  = norm_p.std[:state_size]
+                    rssm_obs = (rssm_obs - state_mean) / state_std
                 new_rssm_st, new_disag_st, rssm_rewards, rssm_metrics = _train_rssm(
                     training_state.rssm_state,
                     training_state.disag_state,
@@ -1250,9 +1261,12 @@ class GoExplore:
 
         # ── Evaluator ─────────────────────────────────────────────────────────
         def eval_actor_step(training_state, env, env_state, extra_fields=()):
+            obs_in = env_state.obs
+            if self.normalize_obs:
+                obs_in = running_statistics.normalize(obs_in, training_state.normalizer_params)
             actions = gcp_actor.sample_actions(
                 training_state.actor_state.params,
-                env_state.obs,
+                obs_in,
                 jax.random.PRNGKey(0),
                 is_deterministic=True,
             )
@@ -1338,11 +1352,17 @@ class GoExplore:
                 last_visualization_step = current_step
 
             do_render = ne % config.visualization_interval == 0
+            # Visualisation policies must normalise obs to match the trained networks
+            _viz_norm_p = training_state.normalizer_params if self.normalize_obs else None
+            def _viz_norm(obs):
+                if _viz_norm_p is None:
+                    return obs
+                return running_statistics.normalize(obs, _viz_norm_p)
             if self.agent_type == "crl":
-                make_policy = lambda param: lambda obs, rng: gcp_actor.apply(param, obs)
+                make_policy = lambda param: lambda obs, rng: gcp_actor.apply(param, _viz_norm(obs))
             else:
                 make_policy = lambda param: lambda obs, rng: (
-                    gcp_actor.sample_actions(param, obs, rng, is_deterministic=True), {}
+                    gcp_actor.sample_actions(param, _viz_norm(obs), rng, is_deterministic=True), {}
                 )
 
             # Build full GCP critic params for checkpointing

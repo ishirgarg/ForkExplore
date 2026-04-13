@@ -81,22 +81,27 @@ def _create_q_epistemic_exploration_metric(
         goals: jnp.ndarray,
         proposer_state: GoalProposerState,
     ) -> jnp.ndarray:
+        from brax.training.acme import running_statistics
         actor_params = proposer_state.actor_params
         critic_params = proposer_state.critic_params
         full_critic_params = reconstruct_full_critic_params(critic_params)
+        norm_p = proposer_state.normalizer_params
 
         def one_state(state: jnp.ndarray, goal: jnp.ndarray, key: jax.Array) -> jnp.ndarray:
             obs = jnp.concatenate([state, goal], axis=-1)
+            net_obs = obs[None, :]
+            if norm_p is not None:
+                net_obs = running_statistics.normalize(net_obs, norm_p)
             key, a_key = jax.random.split(key)
             action = actor.sample_actions(
                 actor_params,
-                obs[None, :],
+                net_obs,
                 a_key,
                 is_deterministic=True,
             )[0]
             q_vals = critic.apply(
                 full_critic_params,
-                obs[None, :],
+                net_obs,
                 action[None, :],
             )[0]
             return jnp.std(q_vals)

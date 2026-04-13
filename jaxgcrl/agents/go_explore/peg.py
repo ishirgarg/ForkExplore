@@ -307,6 +307,7 @@ def mppi_plan_goal(
     obs_encoder_params: Optional[Any] = None,
     obs_decoder: Optional[ObsDecoder] = None,
     obs_decoder_params: Optional[Any] = None,
+    normalizer_params: Optional[Any] = None,
 ) -> jnp.ndarray:
     """MPPI planning to find goal maximising cumulative ensemble disagreement.
 
@@ -352,6 +353,18 @@ def mppi_plan_goal(
 
     use_latent = obs_encoder is not None
 
+    # Pre-compute state/goal mean+std slices from the obs-size normaliser so we
+    # can match the normalised space the world model and actor were trained in.
+    state_size_local = current_state.shape[-1]
+    if normalizer_params is not None and not use_latent:
+        state_mean = normalizer_params.mean[:state_size_local]
+        state_std  = normalizer_params.std[:state_size_local]
+        goal_mean  = normalizer_params.mean[state_size_local:]
+        goal_std   = normalizer_params.std[state_size_local:]
+        current_state = (current_state - state_mean) / state_std
+    else:
+        state_mean = state_std = goal_mean = goal_std = None
+
     if use_latent:
         # Encode current state once; latent rollout thereafter
         current_z = obs_encoder.apply(obs_encoder_params, current_state[None, :])[0]
@@ -390,14 +403,20 @@ def mppi_plan_goal(
     else:
         def eval_fitness(goals, rng):
             """Simulate obs-space rollouts, return cumulative disagreement."""
+            # current_state was pre-normalised above when normalizer_params is set,
+            # so the WM (trained on normalised obs) operates in a consistent space.
             states = jnp.tile(current_state[None, :], (num_samples, 1))
+            if goal_mean is not None:
+                goals_for_actor = (goals - goal_mean) / goal_std
+            else:
+                goals_for_actor = goals
 
             def step_fn(carry, _):
                 states, total_reward, rng = carry
                 rng, action_rng = jax.random.split(rng)
 
                 # GCP actor produces actions toward candidate goals
-                obs = jnp.concatenate([states, goals], axis=-1)
+                obs = jnp.concatenate([states, goals_for_actor], axis=-1)
                 actions = gcp_actor.sample_actions(
                     actor_params, obs, action_rng, is_deterministic=False
                 )

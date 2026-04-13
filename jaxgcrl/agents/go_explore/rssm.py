@@ -539,6 +539,7 @@ def mppi_plan_goal_rssm(
     num_iterations: int,
     gamma: float,
     key: jax.Array,
+    normalizer_params: Optional[Any] = None,
 ) -> jnp.ndarray:
     """MPPI planning through RSSM imagination to maximise disagreement.
 
@@ -561,6 +562,19 @@ def mppi_plan_goal_rssm(
         (goal_dim,) planned goal.
     """
 
+    # Pre-compute state-prefix and goal-suffix slices of the obs normaliser so
+    # the RSSM (trained on normalised state slices) and the GCP actor (trained
+    # on normalised [state, goal]) both see consistent inputs.
+    state_size_local = current_obs.shape[-1]
+    if normalizer_params is not None:
+        state_mean = normalizer_params.mean[:state_size_local]
+        state_std  = normalizer_params.std[:state_size_local]
+        goal_mean  = normalizer_params.mean[state_size_local:]
+        goal_std   = normalizer_params.std[state_size_local:]
+        current_obs = (current_obs - state_mean) / state_std
+    else:
+        goal_mean = goal_std = None
+
     # Encode current obs → initial RSSM state (posterior, zero prior)
     obs_1 = current_obs[None, None, :]                # (1, 1, obs_dim)
     action_zero = jnp.zeros((1, 1, action_dim))       # (1, 1, action_dim)
@@ -581,6 +595,12 @@ def mppi_plan_goal_rssm(
         # Tile initial RSSM state for all candidates
         stochs = jnp.tile(init_stoch[None, :], (num_samples, 1))
         deters = jnp.tile(init_deter[None, :], (num_samples, 1))
+        # Goals are MPPI-sampled in raw physical space (between goal_min/goal_max);
+        # normalise them once for the actor input which expects normalised obs.
+        if goal_mean is not None:
+            goals_for_actor = (goals - goal_mean) / goal_std
+        else:
+            goals_for_actor = goals
 
         def step_fn(carry, _):
             stoch, deter, total, rng = carry
@@ -588,9 +608,10 @@ def mppi_plan_goal_rssm(
 
             # GCP actor: concat(decoded_obs_approx, goal)
             feat = jnp.concatenate([stoch, deter], axis=-1)  # (S, F)
-            # Decode feat → obs for actor input
+            # Decode feat → obs for actor input. RSSM was trained on normalised
+            # obs (when normalize_obs is on) so obs_hat is already in that space.
             obs_hat = rssm_module.apply(rssm_params, feat, method=RSSMWorldModel.decode)  # (S, obs_dim)
-            actor_input = jnp.concatenate([obs_hat, goals], axis=-1)
+            actor_input = jnp.concatenate([obs_hat, goals_for_actor], axis=-1)
             actions = gcp_actor.sample_actions(
                 actor_params, actor_input, action_rng, is_deterministic=False
             )  # (S, action_dim)
@@ -621,7 +642,9 @@ def mppi_plan_goal_rssm(
         goals = means[None, :] + stds[None, :] * jax.random.normal(sample_rng, (num_samples, goal_dim))
         goals = jnp.clip(goals, goal_min, goal_max)
         fitness = eval_fitness(goals, eval_rng)
-        weights = jax.nn.softmax(gamma * fitness)[:, None]
+        # Shift by max for numerical stability (log-sum-exp trick)
+        fitness_shifted = gamma * (fitness - jnp.max(fitness))
+        weights = jax.nn.softmax(fitness_shifted)[:, None]
         new_means = jnp.sum(weights * goals, axis=0)
         new_stds = jnp.sqrt(jnp.sum(weights * (goals - new_means) ** 2, axis=0) + 1e-6)
         return (new_means, new_stds, rng), None

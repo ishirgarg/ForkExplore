@@ -2,9 +2,36 @@ from typing import Any, Callable, Optional
 
 import jax
 import jax.numpy as jnp
+from brax.training.acme import running_statistics
 from jaxgcrl.agents.go_explore.algorithms_utils import reconstruct_full_critic_params
 from jaxgcrl.agents.go_explore.types import GoalProposerState
 from jaxgcrl.agents.go_explore.utils import geometric_sample_one_triple
+
+
+def _maybe_normalize(obs: jnp.ndarray, normalizer_params: Any) -> jnp.ndarray:
+    """Normalise obs with running stats if normalizer_params is set, else identity.
+
+    Networks queried inside goal proposers were trained on normalised obs when
+    GoExplore.normalize_obs is enabled, so any obs constructed from raw replay
+    buffer / env data must be normalised before the actor / critic forward pass.
+    """
+    if normalizer_params is None:
+        return obs
+    return running_statistics.normalize(obs, normalizer_params)
+
+
+def _maybe_normalize_state(state: jnp.ndarray, normalizer_params: Any) -> jnp.ndarray:
+    """Apply the state-prefix of the (obs_size,) normaliser to a state-only tensor.
+
+    Used by proposers that pass only the state slice (not full obs) to a network
+    trained on the normalised state slice (e.g. TLDR traj encoder).
+    """
+    if normalizer_params is None:
+        return state
+    state_dim = state.shape[-1]
+    mean = normalizer_params.mean[..., :state_dim]
+    std  = normalizer_params.std[..., :state_dim]
+    return (state - mean) / std
 
 
 def create_goal_proposer(
@@ -228,7 +255,8 @@ def create_ucgr_goal_proposer(
         #
         # This is a single forward pass of size K (vs the O(K²) cost of scoring
         # every g against every anchor).
-        q_vals = critic.apply(full_params, anchor_obs, anchor_acts)  # (K, n_critics)
+        anchor_obs_in = _maybe_normalize(anchor_obs, goal_proposer_state.normalizer_params)
+        q_vals = critic.apply(full_params, anchor_obs_in, anchor_acts)  # (K, n_critics)
         scores = jnp.mean(q_vals, axis=-1)                           # (K,)
  
         # ── 4. Select the hardest (lowest MinLSE score) goal ─────────────────
@@ -282,27 +310,30 @@ def create_q_epistemic_goal_proposer(
         # Reconstruct full critic params using utility function
         full_critic_params = reconstruct_full_critic_params(critic_params)
         
+        norm_p = goal_proposer_state.normalizer_params
+
         # For each candidate goal, compute Q-value mean and std
         def compute_q_stats_for_goal(candidate_goal, rng_key):
             """Compute Q-value mean and std for a single candidate goal."""
             # Construct observation: obs = [s0, g] where s0 is from start_obs and g is candidate_goal
             # Observation structure is [state, goal], so concatenate state with candidate goal
             obs = jnp.concatenate([s0, candidate_goal], axis=-1)  # Shape: (obs_size,)
-            
+            net_obs = _maybe_normalize(obs[None, :], norm_p)  # (1, obs_size)
+
             # Sample action deterministically from policy
             rng_key, action_key = jax.random.split(rng_key)
             action = actor.sample_actions(
                 actor_params,
-                obs[None, :],  # Add batch dimension: (1, obs_size)
+                net_obs,
                 action_key,
                 is_deterministic=True
             )  # Shape: (1, action_size)
             action = action[0]  # Remove batch dimension: (action_size,)
-            
+
             # Compute Q-values using critic
             q_values = critic.apply(
                 full_critic_params,
-                obs[None, :],  # Add batch dimension: (1, obs_size)
+                net_obs,
                 action[None, :]  # Add batch dimension: (1, action_size)
             )  # Shape: (1, n_critics)
             q_values = q_values[0]  # Remove batch dimension: (n_critics,)
@@ -386,27 +417,29 @@ def create_max_critic_to_env_goal_proposer(
         
         # Reconstruct full critic params using utility function
         full_critic_params = reconstruct_full_critic_params(critic_params)
-        
+        norm_p = goal_proposer_state.normalizer_params
+
         # For each candidate state w, compute mean Q(w, g)
         def compute_mean_q_for_state(candidate_state, rng_key):
             """Compute mean Q-value for a single candidate state w with goal g."""
             # Construct observation: obs = [w, g] where w is candidate_state and g is env_goal
             obs = jnp.concatenate([candidate_state, env_goal], axis=-1)  # Shape: (obs_size,)
-            
+            net_obs = _maybe_normalize(obs[None, :], norm_p)
+
             # Sample action deterministically from policy
             rng_key, action_key = jax.random.split(rng_key)
             action = actor.sample_actions(
                 actor_params,
-                obs[None, :],  # Add batch dimension: (1, obs_size)
+                net_obs,
                 action_key,
                 is_deterministic=True
             )  # Shape: (1, action_size)
             action = action[0]  # Remove batch dimension: (action_size,)
-            
+
             # Compute Q-values using critic
             q_values = critic.apply(
                 full_critic_params,
-                obs[None, :],  # Add batch dimension: (1, obs_size)
+                net_obs,
                 action[None, :]  # Add batch dimension: (1, action_size)
             )  # Shape: (1, n_critics)
             q_values = q_values[0]  # Remove batch dimension: (n_critics,)
@@ -722,10 +755,15 @@ def create_tldr_goal_proposer(
         cand_indices = jax.random.randint(sample_rng, (num_candidates,), 0, n_buf)
         candidate_obs = next_obs_flat[cand_indices]  # (num_candidates, obs_size)
         candidate_states = candidate_obs[:, :state_size]  # raw state only
+        # The traj encoder is trained on normalised state slices in update_networks,
+        # so feed it normalised states here too.
+        candidate_states_in = _maybe_normalize_state(
+            candidate_states, goal_proposer_state.normalizer_params,
+        )
 
         # Score candidates by PBE novelty in latent space
         scores = pbe_score_candidates(
-            te_params, traj_encoder, candidate_states, knn_k, knn_clip,
+            te_params, traj_encoder, candidate_states_in, knn_k, knn_clip,
         )
 
         # Select most novel candidate
@@ -788,6 +826,7 @@ def create_peg_goal_proposer(
             obs_encoder_params=enc_params,
             obs_decoder=obs_decoder,
             obs_decoder_params=dec_params,
+            normalizer_params=goal_proposer_state.normalizer_params,
         )
 
         log_data = {
@@ -844,6 +883,7 @@ def create_peg_rssm_goal_proposer(
             current_state, action_size, goal_dim, goal_min, goal_max,
             mppi_samples, mppi_horizon, mppi_iterations, mppi_gamma,
             rng,
+            normalizer_params=goal_proposer_state.normalizer_params,
         )
 
         log_data = {
