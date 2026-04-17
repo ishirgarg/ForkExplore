@@ -34,7 +34,9 @@ from jaxgcrl.envs.wrappers import (
 )
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
-from jaxgcrl.agents.go_explore.visualization import handle_goal_proposer_visualization
+from jaxgcrl.agents.go_explore.visualization import (
+    handle_goal_proposer_visualization,
+)
 
 from .types import TrainingState, Transition, GoalProposerState, ExploreRewardState
 from .algorithms import get_algorithm
@@ -93,7 +95,7 @@ class GoExplore:
 
     repr_dim: int = 64
     use_ln: bool = True
-    normalize_obs: bool = True  # normalise raw state observations with online running stats
+    normalize_obs: bool = False  # normalise raw state observations with online running stats
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
@@ -182,10 +184,27 @@ class GoExplore:
         "max_critic_to_env", "mega", "omega", "tldr", "peg",
     ]] = None
 
+    # ── Goal-proposer selection (greedy vs softmax-sampled over scores) ─────
+    # When sample_goals=False (default) or goal_sampling_temperature=0.0 the
+    # proposer falls back to greedy argmax/argmin, matching upstream behavior.
+    sample_goals: bool = False
+    goal_sampling_temperature: float = 0.0
+    normalize_scores: bool = False
+
     # ── Fork redistribution (None = disabled) ───────────────────────────────
-    fork_type: Optional[str] = None  # "smc"
+    fork_type: Optional[str] = None  # "smc" | "top_k"
     fork_sampling_temperature: float = 1.0
-    exploration_metric_name: str = "q_epistemic"
+    # SMC resamples only when ESS < ess_fraction * n_explore_envs.
+    # At ess_fraction=1.0 the fork fires every step; at 0.0 it never fires;
+    # standard SMC practice is ~0.5.
+    ess_fraction: float = 0.5
+    # For fork_type == "top_k": copy the top-k explore-phase envs' states into
+    # the bottom-k.  Must be > 0 and <= num_envs/2 (no overlap).
+    fork_top_k: int = 0
+    exploration_metric_name: str = "q_epistemic"  # "q_epistemic" | "rnd" | "log_density"
+    # ── RND exploration metric (used when exploration_metric_name == "rnd") ─
+    rnd_output_dim: int = 32
+    rnd_lr: float = 3e-4
 
     def check_config(self, config):
         assert config.episode_length - 1 == self.num_gcp_steps + self.num_ep_steps, (
@@ -197,6 +216,11 @@ class GoExplore:
         if self.fork_type is not None:
             assert config.episode_length % self.unroll_length == 0, (
                 "episode_length must be divisible by unroll_length when fork is enabled"
+            )
+        if self.fork_type == "top_k":
+            assert 0 < self.fork_top_k <= config.num_envs // 2, (
+                "fork_top_k must be > 0 and <= num_envs / 2 (so top-k and "
+                "bottom-k cannot overlap)"
             )
 
     def train_fn(
@@ -217,6 +241,7 @@ class GoExplore:
         state_size  = train_env.state_dim
         goal_size   = len(train_env.goal_indices)
         obs_size    = state_size + goal_size
+        goal_indices_static = tuple(int(i) for i in np.asarray(train_env.goal_indices))
 
         # ── Eval env ──────────────────────────────────────────────────────────
         eval_env = TrajectoryIdWrapper(eval_env)
@@ -487,6 +512,36 @@ class GoExplore:
                 lr=self.rssm_lr, eps=self.rssm_eps, clip=self.rssm_clip, wd=self.rssm_wd,
             )
 
+        # ── RND target / predictor (for "rnd" exploration metric) ────────────
+        rnd_module = None
+        rnd_target_params = None
+        rnd_predictor_state = None
+        rnd_obs_normalizer_params = None
+        use_rnd = (self.fork_type is not None) and (self.exploration_metric_name == "rnd")
+        if use_rnd:
+            from .networks import RNDNetwork
+            rnd_module = RNDNetwork(
+                state_size=state_size,
+                network_width=self.h_dim,
+                network_depth=self.n_hidden,
+                use_relu=self.use_relu,
+                use_ln=self.use_ln,
+                output_dim=self.rnd_output_dim,
+            )
+            key, rnd_target_key, rnd_pred_key = jax.random.split(key, 3)
+            rnd_target_params = rnd_module.init(rnd_target_key, jnp.ones([1, state_size]))
+            rnd_predictor_params = rnd_module.init(rnd_pred_key, jnp.ones([1, state_size]))
+            rnd_predictor_state = TrainState.create(
+                apply_fn=rnd_module.apply,
+                params=rnd_predictor_params,
+                tx=optax.adam(learning_rate=self.rnd_lr),
+            )
+            # Dedicated RND obs normalizer; running stats are seeded by the
+            # prefill rollouts and continually updated from raw states.
+            rnd_obs_normalizer_params = running_statistics.init_state(
+                brax_specs.Array((state_size,), jnp.dtype("float32"))
+            )
+
         # ── Observation normalizer ────────────────────────────────────────────
         # Track stats over the full obs_size (state + goal) so both halves of
         # gcp_obs are independently normalised without shape mismatches.
@@ -519,6 +574,9 @@ class GoExplore:
             obs_decoder_state=obs_decoder_state,
             rssm_state=rssm_state,
             disag_state=disag_state,
+            rnd_target_params=rnd_target_params,
+            rnd_predictor_state=rnd_predictor_state,
+            rnd_obs_normalizer_params=rnd_obs_normalizer_params,
         )
 
         # ── Goal proposer ────────────────────────────────────────────────────
@@ -545,6 +603,9 @@ class GoExplore:
             rssm_module=rssm_module,
             disag_module=disag_module,
             action_size=action_size,
+            sample_goals=self.sample_goals,
+            goal_sampling_temperature=self.goal_sampling_temperature,
+            normalize_scores=self.normalize_scores,
         )
 
         # ── Reset proposer (optional) ────────────────────────────────────────
@@ -568,16 +629,18 @@ class GoExplore:
                 mppi_samples=self.mppi_samples,
                 mppi_iterations=self.mppi_iterations,
                 mppi_gamma=self.mppi_gamma,
+                sample_goals=self.sample_goals,
+                goal_sampling_temperature=self.goal_sampling_temperature,
+                normalize_scores=self.normalize_scores,
             )
 
         # ── Fork redistribution (optional) ───────────────────────────────────
         use_fork = self.fork_type is not None
+        fork_fn = None
         fork_metric_fn = None
         goal_idx_arr = jnp.array(unwrapped_env.goal_indices)
         if use_fork:
-            # We only use fork_metric_fn; the resampling is done inline
-            # with phase masking (go-phase states get -inf scores).
-            _, fork_metric_fn = create_fork_fn(
+            fork_fn, fork_metric_fn = create_fork_fn(
                 fork_type=self.fork_type,
                 env=unwrapped_env,
                 num_envs=config.num_envs,
@@ -588,7 +651,10 @@ class GoExplore:
                 critic=gcp_critic,
                 exploration_metric_name=self.exploration_metric_name,
                 fork_sampling_temperature=self.fork_sampling_temperature,
+                ess_fraction=self.ess_fraction,
+                fork_top_k=self.fork_top_k,
                 discounting=self.discounting,
+                rnd_module=rnd_module,
             )
 
         # ── Explore reward function ──────────────────────────────────────────
@@ -679,6 +745,11 @@ class GoExplore:
             rssm_params=rssm_state.params if rssm_state is not None else None,
             disag_params=disag_state.params if disag_state is not None else None,
             normalizer_params=normalizer_params,
+            rnd_target_params=rnd_target_params,
+            rnd_predictor_params=(
+                rnd_predictor_state.params if rnd_predictor_state is not None else None
+            ),
+            rnd_obs_normalizer_params=rnd_obs_normalizer_params,
         )
 
         # ── actor_step ────────────────────────────────────────────────────────
@@ -765,6 +836,12 @@ class GoExplore:
                 rssm_params=training_state.rssm_state.params if training_state.rssm_state is not None else None,
                 disag_params=training_state.disag_state.params if training_state.disag_state is not None else None,
                 normalizer_params=training_state.normalizer_params,
+                rnd_target_params=training_state.rnd_target_params,
+                rnd_predictor_params=(
+                    training_state.rnd_predictor_state.params
+                    if training_state.rnd_predictor_state is not None else None
+                ),
+                rnd_obs_normalizer_params=training_state.rnd_obs_normalizer_params,
             )
 
             key, k_propose, k_roll, k_fork = jax.random.split(key, 4)
@@ -844,6 +921,15 @@ class GoExplore:
                 flat_raw_obs = data.observation.reshape(-1, obs_size)
                 normalizer_params = running_statistics.update(normalizer_params, flat_raw_obs)
 
+            # ── RND-specific obs normalizer (always on when RND is active) ───
+            # Seeded from the prefill rollouts, then continually updated.
+            rnd_obs_normalizer_params = training_state.rnd_obs_normalizer_params
+            if use_rnd:
+                flat_raw_states = data.observation[..., :state_size].reshape(-1, state_size)
+                rnd_obs_normalizer_params = running_statistics.update(
+                    rnd_obs_normalizer_params, flat_raw_states
+                )
+
             # ── Macro step update ────────────────────────────────────────────
             macro_new = macro_step + self.unroll_length
 
@@ -852,55 +938,40 @@ class GoExplore:
                 def fork_redistribute(es, fkey, gps):
                     fk, rk = jax.random.split(fkey)
                     info = dict(es.info)
-                    phase = info['phase']
-                    in_explore = (phase == 1)
+                    in_explore = (info['phase'] == 1)
 
-                    states_full = es.obs[:, :state_size]
+                    state_slice = es.obs[:, :state_size]
                     goals = info['go_goal']
 
-                    # Score all states, set go-phase scores to -inf so they get
-                    # zero weight in the softmax resampling
-                    all_scores = fork_metric_fn(fk, states_full, goals, gps)
-                    masked_scores = jnp.where(in_explore, all_scores, -jnp.inf)
+                    # Score all envs; go-phase → -inf so fork_fn never treats
+                    # them as donors or recipients of resampled state.
+                    scores = fork_metric_fn(fk, state_slice, goals, gps)
+                    scores = jnp.where(in_explore, scores, -jnp.inf)
 
-                    # Run SMC on all states but with masked scores
-                    n = states_full.shape[0]
-                    logits = masked_scores / jnp.asarray(self.fork_sampling_temperature, dtype=masked_scores.dtype)
-                    logits = logits - jnp.max(logits)
-                    weights = jnp.exp(logits)
-                    weights = weights / (jnp.sum(weights) + 1e-10)
-                    log_w = jnp.log(weights + 1e-10)
-                    rk_split = jax.random.split(rk, n)
-                    indices = jax.vmap(lambda k: jax.random.categorical(k, log_w))(rk_split)
-                    forked_states = states_full[indices]
+                    # Resample the mujoco pipeline state + obs state-slice as
+                    # one pytree so joint angles / velocities / etc. stay in
+                    # sync.  The goal-slice of the obs stays with the recipient.
+                    source_tree = (es.pipeline_state, state_slice)
+                    positions = state_slice[:, goal_idx_arr]
 
-                    # Only apply fork to explore-phase envs
-                    selected = jnp.where(in_explore[:, None], forked_states, states_full)
-                    new_starts = selected[:, goal_idx_arr]
-
-                    # Reset physics for all (JAX traces both), mask to explore only
-                    rk2 = jax.random.split(jax.random.fold_in(rk, 1), num_envs_)
-                    reset_state = train_env.env.reset(rk2, goal=goals, start=new_starts)
-
-                    def _where_explore(x_reset, x_current):
-                        if not hasattr(x_reset, 'shape'):
-                            return x_current
-                        if x_reset.ndim == 0:
-                            return x_current
-                        if x_reset.shape[0] != in_explore.shape[0]:
-                            return x_current
-                        mask = jnp.reshape(in_explore, [in_explore.shape[0]] + [1] * (x_reset.ndim - 1))
-                        return jnp.where(mask, x_reset, x_current)
-
-                    new_pipeline = jax.tree.map(
-                        _where_explore, reset_state.pipeline_state, es.pipeline_state
+                    (new_pipeline, new_state_slice), forked_mask = fork_fn(
+                        rk, source_tree, scores,
+                        env_steps=training_state.env_steps,
+                        positions=positions,
                     )
-                    new_obs = jnp.where(in_explore[:, None], reset_state.obs, es.obs)
 
-                    # Increment traj_id for forked explore envs only
-                    info['traj_id'] = info['traj_id'] + jnp.where(in_explore, 1.0, 0.0)
+                    new_obs = jnp.concatenate(
+                        [new_state_slice, es.obs[:, state_size:]], axis=-1,
+                    )
 
-                    return es.replace(pipeline_state=new_pipeline, obs=new_obs, info=info)
+                    new_info = dict(info)
+                    new_info['traj_id'] = (
+                        info['traj_id'] + forked_mask.astype(jnp.float32)
+                    )
+
+                    return es.replace(
+                        pipeline_state=new_pipeline, obs=new_obs, info=new_info,
+                    )
 
                 env_state = jax.lax.cond(
                     macro_new < episode_length_,
@@ -915,7 +986,10 @@ class GoExplore:
                 lambda: macro_new,
             )
 
-            return env_state, buffer_state, goal_proposer_state, macro_out, normalizer_params
+            return (
+                env_state, buffer_state, goal_proposer_state, macro_out,
+                normalizer_params, rnd_obs_normalizer_params,
+            )
 
         # ── prefill_replay_buffer ─────────────────────────────────────────────
         def prefill_replay_buffer(training_state, env_state, buffer_state, key,
@@ -923,10 +997,11 @@ class GoExplore:
             def f(carry, _):
                 ts, es, bs, k, gps, ms = carry
                 k, new_k = jax.random.split(k)
-                es, bs, gps, ms, norm_p = get_experience(ts, es, bs, k, gps, ms)
+                es, bs, gps, ms, norm_p, rnd_norm_p = get_experience(ts, es, bs, k, gps, ms)
                 ts = ts.replace(
                     env_steps=ts.env_steps + config.num_envs * self.unroll_length,
                     normalizer_params=norm_p,
+                    rnd_obs_normalizer_params=rnd_norm_p,
                 )
                 return (ts, es, bs, new_k, gps, ms), ()
 
@@ -1141,13 +1216,17 @@ class GoExplore:
                           goal_proposer_state, macro_step):
             exp_key, process_key, train_key, rssm_key = jax.random.split(key, 4)
 
-            env_state, buffer_state, updated_gps, macro_next, normalizer_params = get_experience(
+            (
+                env_state, buffer_state, updated_gps, macro_next,
+                normalizer_params, rnd_obs_normalizer_params,
+            ) = get_experience(
                 training_state, env_state, buffer_state, exp_key,
                 goal_proposer_state, macro_step,
             )
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
                 normalizer_params=normalizer_params,
+                rnd_obs_normalizer_params=rnd_obs_normalizer_params,
             )
 
             # Sample raw trajectories (num_envs, episode_length, ...) for RSSM training
@@ -1190,10 +1269,40 @@ class GoExplore:
                     extras={"state_extras": new_se}
                 )
 
+            # ── RND predictor training (one step per training_step) ─────────
+            if use_rnd:
+                rnd_obs = raw_transitions.observation[:, :, :state_size].reshape(-1, state_size)
+                # Whiten with the dedicated RND running stats (seeded in prefill)
+                # and clip to [-5, 5], matching the standard RND obs norm recipe.
+                rnd_norm_p = training_state.rnd_obs_normalizer_params
+                rnd_obs = jnp.clip(
+                    (rnd_obs - rnd_norm_p.mean) / rnd_norm_p.std, -5.0, 5.0,
+                )
+                target_out = jax.lax.stop_gradient(
+                    rnd_module.apply(training_state.rnd_target_params, rnd_obs)
+                )
+
+                def _rnd_loss(pred_params):
+                    pred_out = rnd_module.apply(pred_params, rnd_obs)
+                    return jnp.mean((pred_out - target_out) ** 2)
+
+                rnd_loss_val, rnd_grads = jax.value_and_grad(_rnd_loss)(
+                    training_state.rnd_predictor_state.params
+                )
+                new_rnd_predictor_state = training_state.rnd_predictor_state.apply_gradients(
+                    grads=rnd_grads
+                )
+                training_state = training_state.replace(
+                    rnd_predictor_state=new_rnd_predictor_state
+                )
+                rnd_step_loss = rnd_loss_val
+            else:
+                rnd_step_loss = None
+
             # Flatten and process for GCP + explore policy updates
             transitions, _ = gcp_actor.process_transitions(
                 raw_transitions, process_key, self.batch_size, self.discounting,
-                state_size, tuple(train_env.goal_indices),
+                state_size, goal_indices_static,
                 train_env.goal_reach_thresh, self.use_her,
             )
             (training_state, _), metrics = jax.lax.scan(
@@ -1207,6 +1316,10 @@ class GoExplore:
                 num_batches = jax.tree_util.tree_leaves(metrics)[0].shape[0]
                 for k, v in rssm_metrics.items():
                     metrics[k] = jnp.full((num_batches,), v)
+
+            if use_rnd:
+                num_batches = jax.tree_util.tree_leaves(metrics)[0].shape[0]
+                metrics["rnd_predictor_loss"] = jnp.full((num_batches,), rnd_step_loss)
 
             return (training_state, env_state, buffer_state, updated_gps, macro_next), metrics
 

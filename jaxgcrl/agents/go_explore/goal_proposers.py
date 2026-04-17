@@ -8,6 +8,33 @@ from jaxgcrl.agents.go_explore.types import GoalProposerState
 from jaxgcrl.agents.go_explore.utils import geometric_sample_one_triple
 
 
+def _select_goal_idx(
+    rng: jax.Array,
+    scores: jnp.ndarray,
+    higher_is_better: bool,
+    sample_goals: bool,
+    goal_sampling_temperature: float,
+    normalize_scores: bool,
+) -> jax.Array:
+    """Pick an index into ``scores``: greedy (argmax/argmin) or softmax-sampled.
+
+    Greedy (respecting ``higher_is_better``) is used when ``sample_goals`` is
+    False or ``goal_sampling_temperature`` is 0.  Otherwise the scores are
+    canonicalized to "higher is better," optionally (mean, std) normalized,
+    divided by the temperature, and fed to a categorical.
+    """
+    values = scores if higher_is_better else -scores
+    if not sample_goals or goal_sampling_temperature == 0.0:
+        return jnp.argmax(values)
+    if normalize_scores:
+        mean = jnp.mean(values)
+        std = jnp.std(values)
+        values = (values - mean) / (std + 1e-8)
+    logits = values / jnp.asarray(goal_sampling_temperature, dtype=values.dtype)
+    logits = logits - jnp.max(logits)
+    return jax.random.categorical(rng, logits)
+
+
 def _maybe_normalize(obs: jnp.ndarray, normalizer_params: Any) -> jnp.ndarray:
     """Normalise obs with running stats if normalizer_params is set, else identity.
 
@@ -57,6 +84,9 @@ def create_goal_proposer(
     rssm_module: Optional[Any] = None,
     disag_module: Optional[Any] = None,
     action_size: Optional[int] = None,
+    sample_goals: bool = False,
+    goal_sampling_temperature: float = 0.0,
+    normalize_scores: bool = False,
 ) -> Callable:
     """
     Factory function to create a goal proposer function.
@@ -91,17 +121,47 @@ def create_goal_proposer(
     elif goal_proposer_name == "rb":
         return create_rb_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
     elif goal_proposer_name == "ucgr":
-        return create_ucgr_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic, discounting)
+        return create_ucgr_goal_proposer(
+            env, num_envs, num_candidates, state_size, goal_indices, actor, critic, discounting,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
     elif goal_proposer_name == "q_epistemic":
-        return create_q_epistemic_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
+        return create_q_epistemic_goal_proposer(
+            env, num_envs, num_candidates, state_size, goal_indices, actor, critic,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
     elif goal_proposer_name == "max_critic_to_env":
-        return create_max_critic_to_env_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
+        return create_max_critic_to_env_goal_proposer(
+            env, num_envs, num_candidates, state_size, goal_indices, actor, critic,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
     elif goal_proposer_name == "mega":
-        return create_mega_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices)
+        return create_mega_goal_proposer(
+            env, num_envs, num_candidates, state_size, goal_indices,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
     elif goal_proposer_name == "omega":
-        return create_omega_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices)
+        return create_omega_goal_proposer(
+            env, num_envs, num_candidates, state_size, goal_indices,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
     elif goal_proposer_name == "tldr":
-        return create_tldr_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, traj_encoder, knn_k, knn_clip)
+        return create_tldr_goal_proposer(
+            env, num_envs, num_candidates, state_size, goal_indices, traj_encoder, knn_k, knn_clip,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
     elif goal_proposer_name == "peg":
         return create_peg_goal_proposer(env, num_envs, state_size, goal_indices, actor, wm_modules,
                                         mppi_horizon, mppi_samples, mppi_iterations, mppi_gamma,
@@ -173,6 +233,9 @@ def create_ucgr_goal_proposer(
     actor: Optional[Any] = None,
     critic: Optional[Any] = None,
     discounting: float = 0.99,
+    sample_goals: bool = False,
+    goal_sampling_temperature: float = 0.0,
+    normalize_scores: bool = False,
 ) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
     """
     Create a goal proposer implementing Unsupervised Contrastive Goal-Reaching (UCGR).
@@ -260,7 +323,13 @@ def create_ucgr_goal_proposer(
         scores = jnp.mean(q_vals, axis=-1)                           # (K,)
  
         # ── 4. Select the hardest (lowest MinLSE score) goal ─────────────────
-        best_idx = jnp.argmin(scores)
+        rng, sel_rng = jax.random.split(rng)
+        best_idx = _select_goal_idx(
+            sel_rng, scores, higher_is_better=False,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
         selected_goal = candidate_goals[best_idx]  # (goal_dim,)
  
         # ── 5. Build log_data for visualization ──────────────────────────────
@@ -285,6 +354,9 @@ def create_q_epistemic_goal_proposer(
     goal_indices: Optional[tuple] = None,
     actor: Optional[Any] = None,
     critic: Optional[Any] = None,
+    sample_goals: bool = False,
+    goal_sampling_temperature: float = 0.0,
+    normalize_scores: bool = False,
 ) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
     """
     Create a goal proposer that selects goals with highest Q-value variance across the ensemble.
@@ -353,7 +425,13 @@ def create_q_epistemic_goal_proposer(
         variances = q_stds ** 2
         
         # Select goal with highest variance
-        best_idx = jnp.argmax(variances)
+        rng, sel_rng = jax.random.split(rng)
+        best_idx = _select_goal_idx(
+            sel_rng, variances, higher_is_better=True,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
         selected_goal = candidate_goals[best_idx]  # Shape: (goal_dim,)
         
         # Prepare log_data dict with visualization data
@@ -379,6 +457,9 @@ def create_max_critic_to_env_goal_proposer(
     goal_indices: Optional[tuple] = None,
     actor: Optional[Any] = None,
     critic: Optional[Any] = None,
+    sample_goals: bool = False,
+    goal_sampling_temperature: float = 0.0,
+    normalize_scores: bool = False,
 ) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
     """
     Create a proposer that:
@@ -455,7 +536,13 @@ def create_max_critic_to_env_goal_proposer(
         q_means = jax.vmap(compute_mean_q_for_state)(candidate_states, var_keys)  # Shape: (num_candidates,)
         
         # Select state w that maximizes mean Q(w, g)
-        best_idx = jnp.argmax(q_means)
+        rng, sel_rng = jax.random.split(rng)
+        best_idx = _select_goal_idx(
+            sel_rng, q_means, higher_is_better=True,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
         selected_state = candidate_states[best_idx]  # Shape: (state_size,)
         selected_state_goal = selected_state[jnp.array(goal_indices)]  # Shape: (goal_dim,)
         
@@ -530,6 +617,9 @@ def create_mega_goal_proposer(
     state_size: Optional[int] = None,
     goal_indices: Optional[tuple] = None,
     kde_bandwidth: float = 0.1,
+    sample_goals: bool = False,
+    goal_sampling_temperature: float = 0.0,
+    normalize_scores: bool = False,
 ) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
     """Create a MEGA (Maximum Entropy Goal Achievement) goal proposer.
 
@@ -582,7 +672,13 @@ def create_mega_goal_proposer(
         # (num_candidates,) — lower density ↔ more sparsely explored
 
         # ── 4. Select the minimum-density candidate (frontier goal) ──────────
-        best_idx     = jnp.argmin(densities)
+        rng, sel_rng = jax.random.split(rng)
+        best_idx = _select_goal_idx(
+            sel_rng, densities, higher_is_better=False,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
         selected_goal = candidate_goals[best_idx]  # (goal_dim,)
 
         # ── 5. Build log_data for visualisation ──────────────────────────────
@@ -612,6 +708,9 @@ def create_omega_goal_proposer(
     kde_bandwidth: float = 0.1,
     omega_bias: float = -3.0,
     n_desired_eval: int = 100,
+    sample_goals: bool = False,
+    goal_sampling_temperature: float = 0.0,
+    normalize_scores: bool = False,
 ) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
     """Create an OMEGA goal proposer.
 
@@ -672,7 +771,13 @@ def create_omega_goal_proposer(
         # (num_candidates,) — lower = frontier
 
         # ── 4. MEGA goal: minimum-density candidate ───────────────────────────
-        best_idx   = jnp.argmin(densities)
+        rng, sel_rng = jax.random.split(rng)
+        best_idx = _select_goal_idx(
+            sel_rng, densities, higher_is_better=False,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
         mega_goal  = candidate_goals[best_idx]  # (goal_dim,)
 
         # ── 5. Compute α via DKL(p_dg ‖ p_ag) ────────────────────────────────
@@ -725,6 +830,9 @@ def create_omega_goal_proposer(
 
 def create_tldr_goal_proposer(
     env, num_envs, num_candidates, state_size, goal_indices, traj_encoder, knn_k, knn_clip,
+    sample_goals: bool = False,
+    goal_sampling_temperature: float = 0.0,
+    normalize_scores: bool = False,
 ):
     """Select goals by PBE novelty in the traj encoder's latent space.
 
@@ -767,7 +875,13 @@ def create_tldr_goal_proposer(
         )
 
         # Select most novel candidate
-        best_idx = jnp.argmax(scores)
+        rng, sel_rng = jax.random.split(rng)
+        best_idx = _select_goal_idx(
+            sel_rng, scores, higher_is_better=True,
+            sample_goals=sample_goals,
+            goal_sampling_temperature=goal_sampling_temperature,
+            normalize_scores=normalize_scores,
+        )
         candidate_goals = candidate_states[:, goal_idx_array]  # (num_candidates, goal_dim)
         selected_goal = candidate_goals[best_idx]
 

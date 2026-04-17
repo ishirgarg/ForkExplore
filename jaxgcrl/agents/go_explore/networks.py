@@ -16,7 +16,7 @@ class Encoder(nn.Module):
     @nn.compact
     def __call__(self, data: jnp.ndarray):
         logging.info("encoder input shape: %s", data.shape)
-        lecun_unfirom = variance_scaling(1 / 3, "fan_in", "uniform")
+        lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
 
         if self.use_ln:
@@ -31,7 +31,7 @@ class Encoder(nn.Module):
 
         x = data
         for i in range(self.network_depth):
-            x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+            x = nn.Dense(self.network_width, kernel_init=lecun_uniform, bias_init=bias_init)(x)
             x = normalize(x)
             x = activation(x)
 
@@ -42,7 +42,7 @@ class Encoder(nn.Module):
                     x = x + skip
                     skip = x
 
-        x = nn.Dense(self.repr_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         return x
 
 
@@ -63,12 +63,12 @@ class Actor(nn.Module):
         else:
             activation = nn.swish
 
-        lecun_unfirom = variance_scaling(1 / 3, "fan_in", "uniform")
+        lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
 
         logging.info("actor input shape: %s", x.shape)
         for i in range(self.network_depth):
-            x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init, name=f"hidden_{i}")(x)
+            x = nn.Dense(self.network_width, kernel_init=lecun_uniform, bias_init=bias_init, name=f"hidden_{i}")(x)
             if self.use_ln:
                 x = nn.LayerNorm(name=f"ln_{i}")(x)
             x = activation(x)
@@ -80,8 +80,8 @@ class Actor(nn.Module):
                     x = x + skip
                     skip = x
 
-        mean = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-        log_std = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        mean = nn.Dense(self.action_size, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        log_std = nn.Dense(self.action_size, kernel_init=lecun_uniform, bias_init=bias_init)(x)
 
         log_std = nn.tanh(log_std)
         log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (
@@ -89,6 +89,43 @@ class Actor(nn.Module):
         )  # From SpinUp / Denis Yarats
 
         return mean, log_std
+
+
+class RNDNetwork(nn.Module):
+    """RND target / predictor network.
+
+    Architecture mirrors a single :class:`QNetwork` critic head: an MLP with
+    ``network_depth`` hidden layers of width ``network_width`` (LayerNorm /
+    activation on all but the final layer, matching QNetwork), but the input
+    is a raw state (no action concat) and the output is a ``output_dim``-vector.
+    """
+    state_size: int
+    network_width: int
+    network_depth: int
+    use_relu: bool
+    use_ln: bool
+    output_dim: int = 32
+
+    @nn.compact
+    def __call__(self, state: jnp.ndarray):
+        activation = nn.relu if self.use_relu else nn.swish
+        lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
+        bias_init = nn.initializers.zeros
+
+        x = state
+        for j in range(self.network_depth):
+            x = nn.Dense(
+                self.network_width, kernel_init=lecun_uniform, bias_init=bias_init,
+                name=f"rnd_hidden_{j}",
+            )(x)
+            if j != self.network_depth - 1:
+                if self.use_ln:
+                    x = nn.LayerNorm(name=f"rnd_ln_{j}")(x)
+                x = activation(x)
+        return nn.Dense(
+            self.output_dim, kernel_init=lecun_uniform, bias_init=bias_init,
+            name="rnd_output",
+        )(x)
 
 
 class QNetwork(nn.Module):

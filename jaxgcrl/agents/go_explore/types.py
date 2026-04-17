@@ -80,6 +80,12 @@ class TrainingState:
     # RSSM fields (None when use_rssm=False)
     rssm_state: Optional[TrainState] = None
     disag_state: Optional[TrainState] = None
+    # RND fields (None unless exploration_metric_name == "rnd")
+    rnd_target_params: Optional[Any] = None   # frozen random target net
+    rnd_predictor_state: Optional[TrainState] = None
+    # Dedicated running obs stats for RND (whitened + clipped to [-5, 5]),
+    # always populated when RND is active; seeded from the prefill rollouts.
+    rnd_obs_normalizer_params: Optional[Any] = None
 
 
 class Transition(NamedTuple):
@@ -129,3 +135,6 @@ class GoalProposerState:
     rssm_params: Optional[Any] = None   # RSSM world model params (for peg_rssm goal proposer)
     disag_params: Optional[Any] = None  # Disagreement ensemble params (for peg_rssm goal proposer)
     normalizer_params: Optional[Any] = None  # Running obs normalizer (for MPPI actor calls)
+    rnd_target_params: Optional[Any] = None      # RND target network params (for rnd exploration metric)
+    rnd_predictor_params: Optional[Any] = None   # RND predictor network params (for rnd exploration metric)
+    rnd_obs_normalizer_params: Optional[Any] = None  # RND-specific obs running stats

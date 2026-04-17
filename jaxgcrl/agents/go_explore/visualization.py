@@ -593,6 +593,201 @@ def visualize_go_explore_phases(
 # Module-level variable to track last visualized env_steps (for go_explore only)
 _last_viz_env_steps = -1
 
+# Separate tracker for fork visualizations so it throttles independently.
+_last_fork_viz_env_steps = -1
+_last_fork_grid_viz_env_steps = -1
+_FORK_VIZ_INTERVAL = 500_000
+
+
+def visualize_fork_grid(
+    positions: np.ndarray,
+    scores: np.ndarray,
+    top_k_mask: np.ndarray,
+    bottom_k_mask: np.ndarray,
+    go_mask: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+    env_steps: int = -1,
+) -> None:
+    """Scatter of all envs coloured by exploration score, with distinguishing
+    outlines for top-k (lime), bottom-k (orange), and go-phase (red) envs."""
+    global _last_fork_grid_viz_env_steps
+    if env_steps >= 0:
+        if (_last_fork_grid_viz_env_steps >= 0
+                and (env_steps - _last_fork_grid_viz_env_steps) < _FORK_VIZ_INTERVAL):
+            return
+        _last_fork_grid_viz_env_steps = env_steps
+
+    positions = np.asarray(positions)
+    scores = np.asarray(scores)
+    top_k_mask = np.asarray(top_k_mask).astype(bool)
+    bottom_k_mask = np.asarray(bottom_k_mask).astype(bool)
+    go_mask = np.asarray(go_mask).astype(bool)
+    x_bounds = np.asarray(x_bounds)
+    y_bounds = np.asarray(y_bounds)
+
+    finite_mask = np.isfinite(scores)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    # Explore-phase envs: coloured by exploration score.
+    if np.any(finite_mask):
+        sc = ax.scatter(
+            positions[finite_mask, 0], positions[finite_mask, 1],
+            c=scores[finite_mask], cmap="viridis",
+            s=140, alpha=0.9,
+            edgecolors="black", linewidths=0.4,
+            zorder=3,
+        )
+        plt.colorbar(sc, ax=ax, label="Exploration score")
+
+    # Go-phase envs: greyed fill (no score).
+    if np.any(go_mask):
+        ax.scatter(
+            positions[go_mask, 0], positions[go_mask, 1],
+            c="lightgrey", s=140, alpha=0.6,
+            zorder=2,
+        )
+
+    # Outlines layered above fills.
+    if np.any(go_mask):
+        ax.scatter(
+            positions[go_mask, 0], positions[go_mask, 1],
+            facecolors="none", edgecolors="red",
+            s=260, linewidths=2.2,
+            label=f"Go phase (n={int(go_mask.sum())})", zorder=5,
+        )
+    if np.any(top_k_mask):
+        ax.scatter(
+            positions[top_k_mask, 0], positions[top_k_mask, 1],
+            facecolors="none", edgecolors="lime",
+            s=380, linewidths=3.0,
+            label=f"Top-k (n={int(top_k_mask.sum())})", zorder=6,
+        )
+    if np.any(bottom_k_mask):
+        ax.scatter(
+            positions[bottom_k_mask, 0], positions[bottom_k_mask, 1],
+            facecolors="none", edgecolors="darkorange",
+            s=380, linewidths=3.0,
+            label=f"Bottom-k (n={int(bottom_k_mask.sum())})", zorder=6,
+        )
+
+    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlabel("X Position", fontsize=12)
+    ax.set_ylabel("Y Position", fontsize=12)
+    ax.set_title(
+        "Fork grid — exploration scores + top-k / bottom-k / go outlines",
+        fontsize=13, fontweight="bold",
+    )
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(loc="upper right", fontsize=10)
+
+    plt.tight_layout()
+    wandb.log({"fork_grid": wandb.Image(fig)})
+    plt.close(fig)
+
+
+def visualize_fork_scatter_kde(
+    pre_positions: np.ndarray,
+    post_positions: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+) -> None:
+    """Two-panel scatter+KDE of explore-phase positions before and after a fork event."""
+    pre_positions = np.asarray(pre_positions)
+    post_positions = np.asarray(post_positions)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+    plot_positions_with_heatmap(
+        pre_positions, x_bounds, y_bounds,
+        title="Fork: Explore States (Pre-Resample)", ax=ax1, point_size=20.0, alpha_points=0.7,
+    )
+    plot_positions_with_heatmap(
+        post_positions, x_bounds, y_bounds,
+        title="Fork: Explore States (Post-Resample)", ax=ax2, point_size=20.0, alpha_points=0.7,
+    )
+    plt.tight_layout()
+    wandb.log({"fork_scatter_kde": wandb.Image(fig)})
+    plt.close(fig)
+
+
+def visualize_fork_scores(
+    positions: np.ndarray,
+    scores: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+) -> None:
+    """Single-panel scatter of explore-phase positions, colored by fork score."""
+    positions = np.asarray(positions)
+    scores = np.asarray(scores)
+    x_bounds = np.asarray(x_bounds)
+    y_bounds = np.asarray(y_bounds)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    if len(positions) > 0:
+        scatter = ax.scatter(
+            positions[:, 0],
+            positions[:, 1],
+            c=scores,
+            cmap="viridis",
+            s=60,
+            alpha=0.85,
+            edgecolors="black",
+            linewidths=0.5,
+        )
+        plt.colorbar(scatter, ax=ax, label="Fork score")
+
+    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlabel("X Position", fontsize=12)
+    ax.set_ylabel("Y Position", fontsize=12)
+    ax.set_title("Fork: Explore States Colored by Score", fontsize=14, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect("equal", adjustable="box")
+    plt.tight_layout()
+    wandb.log({"fork_scores": wandb.Image(fig)})
+    plt.close(fig)
+
+
+def handle_fork_visualization(
+    pre_positions: np.ndarray,
+    post_positions: np.ndarray,
+    scores: np.ndarray,
+    in_explore: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+    env_steps: int,
+) -> None:
+    """Throttled dispatcher for fork-related plots.
+
+    Only logs when ``env_steps`` has advanced by at least ``_FORK_VIZ_INTERVAL``
+    since the previous call.  Steps can jump by more than 1 per training
+    iteration, so we use an accumulator instead of a modulo check.
+    """
+    global _last_fork_viz_env_steps
+
+    if _last_fork_viz_env_steps >= 0 and (env_steps - _last_fork_viz_env_steps) < _FORK_VIZ_INTERVAL:
+        return
+    _last_fork_viz_env_steps = env_steps
+
+    in_explore = np.asarray(in_explore).astype(bool)
+    if not np.any(in_explore):
+        return
+
+    pre_positions = np.asarray(pre_positions)[in_explore]
+    post_positions = np.asarray(post_positions)[in_explore]
+    scores = np.asarray(scores)[in_explore]
+
+    visualize_fork_scatter_kde(pre_positions, post_positions, x_bounds, y_bounds)
+    visualize_fork_scores(pre_positions, scores, x_bounds, y_bounds)
+
+
 def handle_goal_proposer_visualization(
     log_data: dict,
     goal_proposer_name: str,
