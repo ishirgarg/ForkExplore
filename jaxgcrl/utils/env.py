@@ -57,6 +57,8 @@ legal_envs = (
     "ant_big_maze",
     "ant_big_maze_hard",
     "ant_hardest_maze",
+    "ant_fork_maze",
+    "ant_tree_maze",
     "humanoid_u_maze",
     "humanoid_big_maze",
     "humanoid_hardest_maze",

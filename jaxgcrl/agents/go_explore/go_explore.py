@@ -198,6 +198,12 @@ class GoExplore:
     # At ess_fraction=1.0 the fork fires every step; at 0.0 it never fires;
     # standard SMC practice is ~0.5.
     ess_fraction: float = 0.5
+    # When True (smc only): run two INDEPENDENT SMC resamples per fork step —
+    # one across go-phase envs, one across explore-phase envs — sharing the
+    # same fork_sampling_temperature but using separate ESS thresholds
+    # (fork_go_phase_ess_fraction for go, ess_fraction for explore).
+    fork_all_envs: bool = False
+    fork_go_phase_ess_fraction: float = 0.5
     # For fork_type == "top_k": copy the top-k explore-phase envs' states into
     # the bottom-k.  Must be > 0 and <= num_envs/2 (no overlap).
     fork_top_k: int = 0
@@ -652,6 +658,8 @@ class GoExplore:
                 exploration_metric_name=self.exploration_metric_name,
                 fork_sampling_temperature=self.fork_sampling_temperature,
                 ess_fraction=self.ess_fraction,
+                fork_all_envs=self.fork_all_envs,
+                fork_go_phase_ess_fraction=self.fork_go_phase_ess_fraction,
                 fork_top_k=self.fork_top_k,
                 discounting=self.discounting,
                 rnd_module=rnd_module,
@@ -943,10 +951,13 @@ class GoExplore:
                     state_slice = es.obs[:, :state_size]
                     goals = info['go_goal']
 
-                    # Score all envs; go-phase → -inf so fork_fn never treats
-                    # them as donors or recipients of resampled state.
+                    # Score all envs. When fork_all_envs=False, we mask
+                    # go-phase to -inf so only explore envs are forked. When
+                    # fork_all_envs=True, the fork closure applies its own
+                    # per-phase masking from `in_explore`, so pass raw scores.
                     scores = fork_metric_fn(fk, state_slice, goals, gps)
-                    scores = jnp.where(in_explore, scores, -jnp.inf)
+                    if not self.fork_all_envs:
+                        scores = jnp.where(in_explore, scores, -jnp.inf)
 
                     # Resample the mujoco pipeline state + obs state-slice as
                     # one pytree so joint angles / velocities / etc. stay in
@@ -958,6 +969,7 @@ class GoExplore:
                         rk, source_tree, scores,
                         env_steps=training_state.env_steps,
                         positions=positions,
+                        in_explore=in_explore,
                     )
 
                     new_obs = jnp.concatenate(

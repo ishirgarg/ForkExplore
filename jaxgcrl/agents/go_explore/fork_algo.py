@@ -67,12 +67,17 @@ def smc_fork(
     temperature: float,
     ess_fraction: float,
     env_steps: Optional[jnp.ndarray] = None,
+    log_prefix: str = "fork",
 ) -> Tuple[Any, jnp.ndarray]:
     """Softmax-resample ``N`` positions with replacement, ESS-gated.
 
-    Go-phase envs (``-inf`` scores) get weight 0, so they are never picked as
+    Ineligible envs (``-inf`` scores) get weight 0, so they are never picked as
     donors; ``forked_mask`` is additionally AND-ed with ``isfinite(scores)`` so
     they are never marked as recipients either.
+
+    ``log_prefix`` controls the wandb key namespace (e.g. ``"fork"``,
+    ``"fork_explore"``, ``"fork_go"``) so callers running SMC twice per step
+    can log both resamples without key collisions.
     """
     scores = scores.astype(jnp.float32)
     n = scores.shape[0]
@@ -98,14 +103,16 @@ def smc_fork(
     new_states = _apply_mask_to_tree(gathered, states, forked_mask)
 
     if env_steps is not None:
-        def _log_stats(ess_val, thr_val, fired_val, n_exp_val, frac_val, steps):
+        prefix = log_prefix
+
+        def _log_stats(ess_val, thr_val, fired_val, n_elig_val, frac_val, steps):
             wandb.log({
-                "fork/ess": float(ess_val),
-                "fork/ess_threshold": float(thr_val),
-                "fork/resample_fired": float(fired_val),
-                "fork/n_explore": float(n_exp_val),
-                "fork/ess_fraction": float(frac_val),
-                "fork/env_steps": int(steps),
+                f"{prefix}/ess": float(ess_val),
+                f"{prefix}/ess_threshold": float(thr_val),
+                f"{prefix}/resample_fired": float(fired_val),
+                f"{prefix}/n_eligible": float(n_elig_val),
+                f"{prefix}/ess_fraction": float(frac_val),
+                f"{prefix}/env_steps": int(steps),
             })
             return jnp.array(0, dtype=jnp.int32)
 
@@ -218,14 +225,23 @@ def create_fork_fn(
     exploration_metric_name: str = "q_epistemic",
     fork_sampling_temperature: float = 1.0,
     ess_fraction: float = 0.5,
+    fork_all_envs: bool = False,
+    fork_go_phase_ess_fraction: float = 0.5,
     fork_top_k: int = 0,
     discounting: float = 0.99,
     rnd_module: Optional[Any] = None,
 ) -> Tuple[ForkFn, ForkMetricFn]:
     """Return ``(fork, exploration_metric)``.
 
-    ``fork(rng, states, scores, env_steps=None, positions=None)
+    ``fork(rng, states, scores, env_steps=None, positions=None, in_explore=None)
         -> (new_states, forked_mask)``
+
+    When ``fork_all_envs=True`` (smc only), the returned closure runs two
+    INDEPENDENT SMC resamples per call — one over the go-phase envs and one
+    over the explore-phase envs — sharing ``fork_sampling_temperature`` but
+    using ``fork_go_phase_ess_fraction`` vs ``ess_fraction`` for their ESS
+    gates.  In that mode the caller must pass unmasked ``scores`` plus an
+    ``in_explore`` boolean mask; the closure applies the per-phase masking.
 
     Environment ``x_bounds`` / ``y_bounds`` are closured in so the caller only
     needs to pass ``positions`` for the grid visualization to fire.
@@ -248,10 +264,33 @@ def create_fork_fn(
 
     if fork_type == "smc":
         temp = fork_sampling_temperature
-        ess = ess_fraction
+        explore_ess = ess_fraction
+        go_ess = fork_go_phase_ess_fraction
 
-        def fork(rng, states, scores, env_steps=None, positions=None):
-            return smc_fork(rng, states, scores, temp, ess, env_steps)
+        if not fork_all_envs:
+            def fork(rng, states, scores, env_steps=None, positions=None, in_explore=None):
+                return smc_fork(rng, states, scores, temp, explore_ess, env_steps)
+
+            return fork, metric_fn
+
+        def fork(rng, states, scores, env_steps=None, positions=None, in_explore=None):
+            if in_explore is None:
+                raise ValueError(
+                    "fork_all_envs=True requires the caller to pass `in_explore`."
+                )
+            explore_rng, go_rng = jax.random.split(rng)
+            explore_scores = jnp.where(in_explore, scores, -jnp.inf)
+            go_scores = jnp.where(in_explore, -jnp.inf, scores)
+
+            states_after_explore, explore_mask = smc_fork(
+                explore_rng, states, explore_scores, temp, explore_ess,
+                env_steps, log_prefix="fork_explore",
+            )
+            new_states, go_mask = smc_fork(
+                go_rng, states_after_explore, go_scores, temp, go_ess,
+                env_steps, log_prefix="fork_go",
+            )
+            return new_states, explore_mask | go_mask
 
         return fork, metric_fn
 
@@ -266,7 +305,7 @@ def create_fork_fn(
             )
         k = int(fork_top_k)
 
-        def fork(rng, states, scores, env_steps=None, positions=None):
+        def fork(rng, states, scores, env_steps=None, positions=None, in_explore=None):
             return top_k_fork(
                 rng, states, scores, k, env_steps,
                 positions=positions, x_bounds=x_bounds, y_bounds=y_bounds,

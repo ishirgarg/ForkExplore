@@ -52,6 +52,29 @@ BIG_MAZE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+TREE_MAZE = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, G, 1, G, 1, G, 1, 1],
+    [1, 1, 0, 1, 0, 1, 0, 1, 1],
+    [1, G, 0, 0, 0, 0, 0, G, 1],
+    [1, 1, 0, 1, 0, 1, G, 1, 1],
+    [1, 1, G, 1, 0, 1, 1, 1, 1],
+    [1, 1, 1, 1, R, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+FORK_MAZE = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, 0, 0, 1, 0, 0, G, 1],
+    [1, 1, 1, 1, 0, 1, 0, 1, 1, 1],
+    [1, G, 0, 0, 0, 0, 0, 0, G, 1],
+    [1, 1, 0, 1, 1, 0, 1, 0, 1, 1],
+    [1, G, 0, 0, 0, 0, 0, 0, G, 1],
+    [1, 1, 1, 1, 0, 1, 0, 1, 1, 1],
+    [1, G, 0, 0, 0, 0, 0, 0, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+]
+
 BIG_MAZE_HARD = [
     [1, 1, 1, 1, 1, 1, 1, 1],
     [1, R, 0, 1, 1, 0, G, 1],
@@ -122,6 +145,10 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = BIG_MAZE
     elif maze_layout_name == "big_maze_hard":
         maze_layout = BIG_MAZE_HARD
+    elif maze_layout_name == "tree_maze":
+        maze_layout = TREE_MAZE
+    elif maze_layout_name == "fork_maze":
+        maze_layout = FORK_MAZE
     elif maze_layout_name == "big_maze_eval":
         maze_layout = BIG_MAZE_EVAL
     elif maze_layout_name == "hardest_maze":
@@ -203,6 +230,10 @@ class AntMaze(PipelineEnv):
             maze_layout = BIG_MAZE_HARD
         elif maze_layout_name == "big_maze_eval":
             maze_layout = BIG_MAZE_EVAL
+        elif maze_layout_name == "tree_maze":
+            maze_layout = TREE_MAZE
+        elif maze_layout_name == "fork_maze":
+            maze_layout = FORK_MAZE
         elif maze_layout_name == "hardest_maze":
             maze_layout = HARDEST_MAZE
         else:
